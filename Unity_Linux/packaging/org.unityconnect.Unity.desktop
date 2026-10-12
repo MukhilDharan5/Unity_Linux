@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Unity
+Comment=Connect with your phone through the Unity daemon
+Exec=unity-gtk
+Icon=org.unityconnect.Unity
+Terminal=false
+Categories=GNOME;GTK;Utility;
+StartupNotify=true

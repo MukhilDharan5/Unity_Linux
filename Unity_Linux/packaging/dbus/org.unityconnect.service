@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.unityconnect
+Exec=@LIBEXEC@/unityd
+SystemdService=unityd.service

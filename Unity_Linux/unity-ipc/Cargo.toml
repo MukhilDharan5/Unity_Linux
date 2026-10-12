@@ -1,0 +1,16 @@
+[package]
+name = "unity-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zbus.workspace = true
+unity-core = { path = "../unity-core" }
+unity-protocol = { path = "../unity-protocol" }
+unity-plugins = { path = "../unity-plugins" }
+futures-lite.workspace = true

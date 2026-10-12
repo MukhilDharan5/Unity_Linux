@@ -1,0 +1,14 @@
+<resources>
+ <color name="unity_window">#242424</color>
+ <color name="unity_surface">#303030</color>
+ <color name="unity_sidebar">#1E1E1E</color>
+ <color name="unity_text">#F6F5F4</color>
+ <color name="unity_muted">#B8B8BD</color>
+ <color name="unity_border">#48484C</color>
+ <color name="unity_accent">#3584E4</color>
+ <color name="unity_accent_text">#99C1F1</color>
+ <color name="unity_accent_soft">#253B54</color>
+ <color name="unity_button">#424246</color>
+ <color name="unity_success">#8FF0A4</color>
+ <color name="unity_success_soft">#263D2F</color>
+</resources>

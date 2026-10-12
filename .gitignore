@@ -1,0 +1,11 @@
+Unity_Linux/target/
+Unity_Linux/.tools/
+Unity_Linux/dist/
+Unity_Android/.tools/
+Unity_Android/.gradle/
+Unity_Android/.kotlin/
+Unity_Android/local.properties
+Unity_Android/**/build/
+Unity_Android/dist/
+__pycache__/
+*.pyc

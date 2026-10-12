@@ -1,0 +1,19 @@
+[Unit]
+Description=Unity local cross-device companion daemon
+After=network.target
+
+[Service]
+Type=dbus
+BusName=org.unityconnect
+ExecStart=@LIBEXEC@/unityd
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+Environment=RUST_LOG=unityd=info,unity_core=info
+
+[Install]
+WantedBy=default.target

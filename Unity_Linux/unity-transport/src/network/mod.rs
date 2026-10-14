@@ -1,25 +1,32 @@
 use crate::{write_frame, FrameReader, Kind, Transport};
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::net::TcpStream;
-use tokio_rustls::server::TlsStream;
 use unity_protocol::Message;
 pub struct LanTransport {
-    stream: TlsStream<TcpStream>,
+    stream: crate::SecureStream,
     reader: FrameReader,
+    kind: Kind,
 }
 impl LanTransport {
-    pub fn new(stream: TlsStream<TcpStream>) -> Self {
+    pub fn new(stream: crate::SecureStream) -> Self {
         Self {
             stream,
             reader: FrameReader::default(),
+            kind: Kind::Lan,
+        }
+    }
+    pub fn bluetooth(stream: crate::SecureStream) -> Self {
+        Self {
+            stream,
+            reader: FrameReader::default(),
+            kind: Kind::Bluetooth,
         }
     }
 }
 #[async_trait]
 impl Transport for LanTransport {
     fn kind(&self) -> Kind {
-        Kind::Lan
+        self.kind
     }
     async fn send(&mut self, m: &Message) -> Result<()> {
         write_frame(&mut self.stream, m).await

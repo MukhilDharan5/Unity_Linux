@@ -29,6 +29,10 @@ class MainActivity : Activity() {
  private val pending by lazy { getSharedPreferences("pending", MODE_PRIVATE) }
  private lateinit var ui: AdwaitaUi
  private lateinit var host: EditText
+ private lateinit var bluetoothAddress: EditText
+ private lateinit var transportRow: AdwaitaUi.Row
+ private var transportMode = "both"
+ private var resumeBluetoothConnect = false
  private lateinit var port: EditText
  private lateinit var fingerprint: EditText
  private lateinit var url: EditText
@@ -44,6 +48,7 @@ class MainActivity : Activity() {
  private lateinit var receivedClipboard: AdwaitaUi.Row
  private lateinit var receivedUrl: AdwaitaUi.Row
  private lateinit var folderRow: AdwaitaUi.Row
+ private lateinit var receivedNotificationPermission: AdwaitaUi.Row
  private lateinit var notificationPermission: AdwaitaUi.Row
  private lateinit var smsPermission: AdwaitaUi.Row
  private lateinit var photoPermission: AdwaitaUi.Row
@@ -54,6 +59,8 @@ class MainActivity : Activity() {
  private val connectedControls = mutableListOf<Pair<View, String>>()
  private val featureRows = linkedMapOf<String, Pair<AdwaitaUi.Row, String>>()
  private val featureSwitches = mutableMapOf<String, Switch>()
+ private var resumed = false
+ private lateinit var screenStatus: AdwaitaUi.Row
  private var selected = Page.OVERVIEW
  private val stateChanged: () -> Unit = { refreshState() }
  private val preferencesChanged = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> runOnUiThread { if (!isDestroyed) refreshState() } }
@@ -78,6 +85,7 @@ class MainActivity : Activity() {
   root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
   if (wide) buildNavigation(body, true)
   content = FrameLayout(this); body.addView(content, LinearLayout.LayoutParams(0, -1, 1f))
+  transportMode = saved?.getString("transport") ?: prefs.getString("transport", "both").orEmpty()
   buildOverview(); buildSharing(saved); buildFeatures(); buildSettings(saved)
   if (!wide) { root.addView(ui.divider()); buildNavigation(root, false) }
   select(selected); refreshState()
@@ -160,13 +168,20 @@ class MainActivity : Activity() {
   val quick = ui.section(page, "Quick actions")
   action(quick, "Send a file", "Choose a document, photo, or other file.", R.drawable.ic_file, feature = "files") { pickFile() }
   action(quick, "Send clipboard", "Share text while Unity is open.", R.drawable.ic_clipboard, feature = "clipboard") { sendClipboard() }
+  action(quick, "Lock computer", "Lock your paired computer’s current session.", R.drawable.ic_shield, R.id.lock_computer_button, "lock") { desktopRequest("lock", "lock") }
   action(quick, "Permissions and features", "Choose what your computer can access.", R.drawable.ic_shield) { select(Page.FEATURES) }
   page.addView(ui.label("Your connection keeps running when you leave this screen.", 13f, secondary = true).apply { gravity = Gravity.CENTER; setPadding(ui.dp(8), 0, ui.dp(8), ui.dp(20)) })
  }
  private fun buildSharing(saved: Bundle?) {
   val page = page(Page.SHARING)
+  val screens = ui.section(page, "Screen sharing", "The device sharing its screen asks for approval each time.")
+  action(screens, "Share phone screen", "View this phone on your computer.", R.drawable.ic_computer, R.id.share_phone_screen, "screen") { desktopRequest("screen", "start", JSONObject().put("source", "phone")) }
+  action(screens, "View and control computer screen", "Approve a screen and keyboard/mouse access on your computer. Touch to click; use the keyboard icon to type.", R.drawable.ic_computer, R.id.view_computer_screen, "screen") { desktopRequest("screen", "start", JSONObject().put("source", "desktop").put("control", true)) }
+  action(screens, "Use phone with laptop display off", "Open the computer viewer, then turn off the laptop backlight. It restores when sharing stops or the connection is lost.", R.drawable.ic_computer, R.id.view_computer_display_off, "screen") { desktopRequest("screen", "start", JSONObject().put("source", "desktop").put("control", true).put("blank_display", true)) }
+  action(screens, "Stop screen sharing", "End capture and close the encrypted stream.", R.drawable.ic_shield, R.id.stop_screen_share) { CompanionService.instance?.features?.screen?.stopRemote() }
+  screenStatus = ui.row("No screen share", "Enable Screen sharing in Features, then connect.", R.drawable.ic_computer); ui.addRow(screens, screenStatus.view)
   val files = ui.section(page, "Files", "Files travel directly between your phone and computer.")
-  action(files, "Send a file", "Choose a file with Android’s document picker.", R.drawable.ic_file, R.id.send_file_button, "files") { pickFile() }
+  action(files, "Send a file", "Choose a file to send. Received files are saved in Downloads/Unity.", R.drawable.ic_file, R.id.send_file_button, "files") { pickFile() }
   transferRow = ui.row("No transfer in progress", "Original files are sent only when you choose them.", R.drawable.ic_sharing); ui.addRow(files, transferRow.view)
   folderRow = action(files, "Shared folder", "Choose a folder for remote browsing.", R.drawable.ic_folder) { chooseFolder() }
   val clip = ui.section(page, "Clipboard", "You decide when text is sent or applied.")
@@ -189,10 +204,32 @@ class MainActivity : Activity() {
   val notifications = ui.section(page, "Notifications")
   feature(notifications, "notifications", "Notification mirroring", "Show phone notifications on your computer.", R.drawable.ic_notification)
   feature(notifications, "notification_actions", "Replies and actions", "Allow supported replies and notification actions.", R.drawable.ic_message)
+  receivedNotificationPermission = action(notifications, "Received file, link and text alerts", "Tap to allow notifications or change their settings.", R.drawable.ic_notification, R.id.received_notification_settings) {
+   if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS) && !prefs.getBoolean("notification_permission_requested", false)) requestNotificationPermission()
+   else {
+    ReceivedItems.channel(this)
+    val settings = if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS)) Settings.ACTION_APP_NOTIFICATION_SETTINGS else Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS
+    startActivity(Intent(settings).putExtra(Settings.EXTRA_APP_PACKAGE, packageName).putExtra(Settings.EXTRA_CHANNEL_ID, ReceivedItems.CHANNEL))
+   }
+  }
   notificationPermission = action(notifications, "Notification access", "Allow access in Android settings.", R.drawable.ic_shield) { settings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }
   val messages = ui.section(page, "Messages and calls")
   feature(messages, "sms", "Messages", "View and send SMS from your computer.", R.drawable.ic_message, R.id.feature_sms)
   feature(messages, "call_notifications", "Incoming calls", "Show incoming call information.", R.drawable.ic_phone)
+  feature(messages, "call_control", "Call management", "Use your current Phone app. Your computer handles call controls and audio over paired Bluetooth hands-free; Unity shares contacts and recent calls with your permission.", R.drawable.ic_phone)
+  action(messages, "Set up call management", "Pair the computer for Bluetooth calls and allow phone, contacts and history access.", R.drawable.ic_phone) {
+   requestPermissions(arrayOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_CONTACTS, Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_PHONE_STATE), 44)
+  }
+  action(messages, "Contacts and call history permissions", "Allow contact search, recent calls and placing calls.", R.drawable.ic_shield) { requestPermissions(arrayOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_CONTACTS, Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_PHONE_STATE), 44) }
+  action(messages, "Phone dial pad", "Make calls and view recent calls on this phone.", R.drawable.ic_phone) { startActivity(Intent(this, DialerActivity::class.java)) }
+  action(messages, "Enable phone speakerphone controls", "Optional: choose Unity as your default Phone app for earpiece, speakerphone and Bluetooth controls on your computer. Unity then provides the phone’s call screen too.", R.drawable.ic_phone) {
+   val role = getSystemService(android.app.role.RoleManager::class.java)
+   if (role.isRoleAvailable(android.app.role.RoleManager.ROLE_DIALER)) {
+    AlertDialog.Builder(this).setTitle("Use Unity as your Phone app?")
+     .setMessage("Android requires the default Phone app to change speakerphone during cellular calls. Unity will show incoming and ongoing calls on this phone, including while disconnected. You can restore your previous Phone app in Android’s Default apps settings.")
+     .setNegativeButton("Cancel", null).setPositiveButton("Choose Phone app") { _, _ -> startActivityForResult(role.createRequestRoleIntent(android.app.role.RoleManager.ROLE_DIALER), 45) }.show()
+   } else message("This phone does not support changing its default Phone app")
+  }
   smsPermission = action(messages, "SMS and phone permissions", "Review the permissions requested by Unity.", R.drawable.ic_shield) { requestPermissions(arrayOf(Manifest.permission.READ_SMS, Manifest.permission.SEND_SMS, Manifest.permission.READ_PHONE_STATE), 2) }
   val sharing = ui.section(page, "Files and photos")
   feature(sharing, "files", "File transfers", "Send and receive files over your local network.", R.drawable.ic_file)
@@ -205,8 +242,12 @@ class MainActivity : Activity() {
   feature(clipboard, "urls", "Web pages", "Share links with explicit open actions.", R.drawable.ic_link, sensitive = false)
   val media = ui.section(page, "Media")
   feature(media, "media", "Media controls", "Share track details, artwork, and playback controls.", R.drawable.ic_media)
+  feature(media, "audio", "Laptop audio on phone", "Allow laptop sound to play here. Start routing from the computer’s Media page.", R.drawable.ic_media, R.id.feature_audio)
   action(media, "Media access", "Uses notification access for active media sessions.", R.drawable.ic_shield) { settings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }
   val remote = ui.section(page, "Remote control")
+  feature(remote, "lock", "Remote device locking", "Lock your computer here, or let your computer lock this phone.", R.drawable.ic_shield, R.id.feature_lock)
+  action(remote, "Activate phone locking", "Android grants only the screen-lock policy. You can remove it in device-admin settings.", R.drawable.ic_shield, R.id.activate_phone_lock) { startActivity(DeviceLock.activation(this)) }
+  feature(remote, "screen", "Screen sharing", "Share and view screens in either direction, with capture approval each time.", R.drawable.ic_computer, R.id.feature_screen)
   feature(remote, "remote_input", "Remote keyboard and touch", "Requires your explicit keyboard or accessibility setup.", R.drawable.ic_keyboard)
   feature(remote, "find", "Find phone", "Allow your computer to ring this phone.", R.drawable.ic_phone, sensitive = false)
   feature(remote, "ringer", "Ringer and Do Not Disturb", "Allow supported sound-mode changes.", R.drawable.ic_notification, sensitive = false)
@@ -217,10 +258,6 @@ class MainActivity : Activity() {
   val network = ui.section(page, "Internet sharing")
   feature(network, "hotspot", "Sharing requests", "Computer requests open a review prompt on your phone.", R.drawable.ic_wifi, sensitive = false)
   action(network, "Internet sharing settings", "You choose whether to enable tethering.", R.drawable.ic_wifi) { settings(Settings.ACTION_WIRELESS_SETTINGS) }
-  val unavailable = ui.section(page, "Not available in this build")
-  ui.addRow(unavailable, ui.row("Bluetooth transport", "Secure LAN is supported. BLE communication is not implemented.", R.drawable.ic_info).view)
-  ui.addRow(unavailable, ui.row("Call answering", "Requires a supported dialer or telephony integration.", R.drawable.ic_phone).view)
-  ui.addRow(unavailable, ui.row("Screen mirroring", "Capture, encoding, and rendering are not implemented.", R.drawable.ic_computer).view)
  }
  private fun feature(card: LinearLayout, id: String, title: String, description: String, icon: Int, viewId: Int? = null, sensitive: Boolean = true) {
   val toggle = ui.toggle(prefs.getBoolean("enable.$id", !sensitive), title) { checked -> prefs.edit().putBoolean("enable.$id", checked).apply(); CompanionService.instance?.features?.publish(); refreshState() }
@@ -231,7 +268,16 @@ class MainActivity : Activity() {
  }
  private fun buildSettings(saved: Bundle?) {
   val page = page(Page.SETTINGS)
-  val connection = ui.section(page, "Computer connection", "Use the same local network. Compare the full TLS fingerprint shown in Unity on your computer before pairing.")
+  val connection = ui.section(page, "Computer connection", "Keep Bluetooth and Wi-Fi / LAN connected together. Controls use Bluetooth; files and streams use Wi-Fi / LAN. Compare the full TLS fingerprint shown on your computer before pairing.")
+  transportRow = action(connection, "Connection method", "", R.drawable.ic_link, R.id.connection_method) {
+   AlertDialog.Builder(this).setTitle("Connection method").setSingleChoiceItems(arrayOf("Bluetooth + Wi-Fi / LAN", "Wi-Fi / LAN only", "Bluetooth only"), when (transportMode) { "lan" -> 1; "bluetooth" -> 2; else -> 0 }) { dialog, index ->
+    transportMode = when (index) { 1 -> "lan"; 2 -> "bluetooth"; else -> "both" }; dialog.dismiss(); refreshConnectionFields()
+   }.setNegativeButton("Cancel", null).show()
+  }
+  bluetoothAddress = ui.field(connection, "Computer Bluetooth address", saved?.getString("bluetooth_address") ?: prefs.getString("bluetooth_address", "").orEmpty(), R.id.bluetooth_address,
+   InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS).apply { hint = "AA:BB:CC:DD:EE:FF"; setSingleLine() }
+  action(connection, "Choose Bluetooth computer", "Pair the computer in Android Bluetooth settings, then choose it here.", R.drawable.ic_computer, R.id.choose_bluetooth_computer) { chooseBluetoothComputer() }
+  action(connection, "Bluetooth system settings", "Turn on Bluetooth and pair your phone and computer.", R.drawable.ic_settings) { settings(Settings.ACTION_BLUETOOTH_SETTINGS) }
   host = ui.field(connection, "Computer address", saved?.getString("host") ?: prefs.getString("host", "")!!, R.id.computer_host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI).apply { hint = "192.168.1.10"; setSingleLine() }
   port = ui.field(connection, "Port", saved?.getString("port") ?: prefs.getInt("port", 17161).toString(), R.id.computer_port, InputType.TYPE_CLASS_NUMBER).apply { setSingleLine() }
   fingerprint = ui.field(connection, "Verified TLS fingerprint", saved?.getString("fingerprint") ?: prefs.getString("fingerprint", "")!!, R.id.computer_fingerprint, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or InputType.TYPE_TEXT_FLAG_MULTI_LINE).apply {
@@ -245,6 +291,7 @@ class MainActivity : Activity() {
   val privacy = ui.section(page, "Notification privacy", "Excluded apps will not send new notifications to your computer.")
   excluded = ui.field(privacy, "Excluded app packages", saved?.getString("excluded") ?: prefs.getString("notification_excluded", "")!!, R.id.excluded_apps, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE).apply { hint = "com.example.private, com.example.work"; minLines = 2; maxLines = 5; setHorizontallyScrolling(false) }
   action(privacy, "Save exclusions", "Separate Android package names with commas.", R.drawable.ic_check) { prefs.edit().putString("notification_excluded", excluded.text.toString().take(4096)).apply(); message("Notification exclusions saved") }
+  refreshConnectionFields()
   val about = ui.section(page, "About Unity")
   ui.addRow(about, ui.row("Local. Private. Connected.", "No cloud account, external server, or telemetry.", R.drawable.ic_shield).view)
   ui.addRow(about, ui.row("Android companion", "Version ${packageManager.getPackageInfo(packageName, 0).versionName} · Unity protocol 1", R.drawable.ic_info).view)
@@ -254,15 +301,15 @@ class MainActivity : Activity() {
   val service = CompanionService.instance; val state = service?.uiState ?: ConnectionState.disconnected; val ready = service?.connection?.ready == true
   val transfer = service?.transferState ?: TransferState()
   connectionTitle.text = state.title; connectionDetail.text = state.detail
-  connectionBadge.text = if (ready) "Encrypted · Local network" else "Local connection"
+  connectionBadge.text = if (ready) "Encrypted · ${service.connection.transportLabel}" else "Local connection"
   connectionBadge.setTextColor(if (ready) ui.success else ui.muted); connectionBadge.background = ui.shape(if (ready) ui.successSoft else ui.sidebar, 20)
-  val address = prefs.getString("host", "").orEmpty(); computerRow.title.text = address.ifBlank { "Add your computer" }
-  ui.describe(computerRow, if (address.isBlank()) "Pair once. Stay connected locally." else if (ready) "Connected over Wi-Fi / LAN" else "${state.title} · Tap to review connection settings")
+  val address = prefs.getString(if (prefs.getString("transport", "both") == "bluetooth") "bluetooth_address" else "host", "").orEmpty(); computerRow.title.text = address.ifBlank { "Add your computer" }
+  ui.describe(computerRow, if (address.isBlank()) "Pair once. Stay connected locally." else if (ready) "Connected over ${service.connection.transportLabel}" else "${state.title} · Tap to review connection settings")
   connectButton.text = if (address.isBlank()) "Set up computer" else if (service != null) "Reconnect" else "Connect"
   connectButton.isEnabled = state.phase !in listOf(ConnectionPhase.CONNECTING, ConnectionPhase.PAIRING); disconnectButton.isEnabled = service != null
   connectedControls.forEach { (view, feature) ->
    val enabled = ready && service.features.modules[feature]?.capability()?.optString("status") in listOf("available", "user_action_required")
-   view.isEnabled = enabled && (feature != "files" || !transfer.busy); view.alpha = if (view.isEnabled) 1f else .45f
+   view.isEnabled = enabled && (feature !in listOf("lock", "screen") || service.connection.desktopAvailable(feature)) && (feature != "files" || !transfer.busy); view.alpha = if (view.isEnabled) 1f else .45f
   }
   receivedClipboard.view.isEnabled = pending.contains("clipboard"); receivedClipboard.view.alpha = if (receivedClipboard.view.isEnabled) 1f else .45f
   ui.describe(receivedClipboard, if (pending.contains("clipboard")) "Text is waiting. Tap to copy it on this phone." else "No text waiting.")
@@ -270,6 +317,10 @@ class MainActivity : Activity() {
   ui.describe(folderRow, if (prefs.contains("tree")) "A folder is selected. Tap to change it." else "Choose a folder for remote browsing.")
   val listener = getSystemService(NotificationManager::class.java).isNotificationListenerAccessGranted(ComponentName(this, PhoneNotifications::class.java))
   ui.describe(notificationPermission, if (listener) "Allowed in Android settings." else "Not allowed. Tap to review Android settings.")
+  val notificationManager = getSystemService(NotificationManager::class.java)
+  val receivedChannel = notificationManager.getNotificationChannel(ReceivedItems.CHANNEL)
+  val canNotify = (Build.VERSION.SDK_INT < 33 || granted(Manifest.permission.POST_NOTIFICATIONS)) && notificationManager.areNotificationsEnabled() && receivedChannel?.importance != NotificationManager.IMPORTANCE_NONE
+  ui.describe(receivedNotificationPermission, if (canNotify) "Tap a received file or link to open it directly. Shared text can be opened or copied." else "Notifications are disabled. Tap to allow received item alerts.")
   ui.describe(smsPermission, if (granted(Manifest.permission.READ_SMS) && granted(Manifest.permission.SEND_SMS) && granted(Manifest.permission.READ_PHONE_STATE)) "Permissions granted." else "Some permissions are missing. Tap to review.")
   ui.describe(photoPermission, if (photoGranted()) "Photo access granted. Enable file transfers to download originals." else "Not allowed. Choose which photos may be shared.")
   ui.describe(dndPermission, if (getSystemService(NotificationManager::class.java).isNotificationPolicyAccessGranted) "Policy access allowed." else "Not allowed. Tap to review Android settings.")
@@ -277,18 +328,36 @@ class MainActivity : Activity() {
    val (row, description) = value; val toggle = featureSwitches.getValue(id); val enabled = prefs.getBoolean("enable.$id", id !in sensitive)
    if (toggle.isChecked != enabled) toggle.isChecked = enabled
    val capability = service?.features?.modules?.get(id)?.capability()
-   val summary = when { !enabled -> null; capability != null && capability.optString("status") == "available" -> "Ready"; capability != null -> capability.optString("reason"); else -> permissionHint(id, listener) ?: "Ready to connect" }
+   val summary = when { !enabled -> null; id == "audio" && service?.features?.audio?.playing == true -> "Playing laptop audio"; id == "audio" && service?.features?.audio?.lastError?.isNotBlank() == true -> service.features.audio.lastError; capability != null && capability.optString("status") == "available" -> "Ready"; capability != null -> capability.optString("reason"); else -> permissionHint(id, listener) ?: "Ready to connect" }
    ui.describe(row, if (summary == null) description else "$description\n$summary")
   }
+  val screen = service?.features?.screen
+  screenStatus.title.text = when { screen?.active() == true -> if (screen.source() == "phone") "Sharing phone screen" else "Viewing computer screen"; screen?.lastError?.isNotBlank() == true -> "Screen sharing ended"; else -> "No screen share" }
+  ui.describe(screenStatus, screen?.lastError?.ifBlank { null } ?: if (screen?.active() == true) "${screen.state.replaceFirstChar { it.uppercase() }} · Tap Stop screen sharing to end." else "Enable Screen sharing in Features, then connect.")
+  if (resumed && !isFinishing) screen?.presentPending(this)
   transferRow.title.text = transfer.title
   ui.describe(transferRow, if (transfer.busy) "Keep the local connection available until the transfer finishes." else if (transfer.failed) "Check your connection and try again." else "Original files are sent only when you choose them.")
  }
- private fun connect() {
-  if (host.text.isBlank() || fingerprint.text.isBlank()) { select(Page.SETTINGS); if (host.text.isBlank()) host.requestFocus() else fingerprint.requestFocus(); message("Enter your computer address and verified TLS fingerprint"); return }
+ private fun desktopRequest(feature: String, action: String, data: JSONObject = JSONObject()) {
+  val service = CompanionService.instance ?: error("Connect first")
+  service.connection.request(feature, action, data) { ok, error -> if (!ok) message(error) else if (feature == "lock") message("Computer locked") }
+ }
+ private fun connect(skipBluetoothPermission: Boolean = false) {
+  if ((transportMode != "bluetooth" && host.text.isBlank()) || fingerprint.text.isBlank()) { select(Page.SETTINGS); if (transportMode != "bluetooth" && host.text.isBlank()) host.requestFocus() else fingerprint.requestFocus(); message("Enter your computer address and verified TLS fingerprint"); return }
   val pin = fingerprint.text.toString().lowercase().filterNot { it == ':' || it.isWhitespace() }
   require(pin.length == 64 && Protocol.unhex(pin).size == 32) { "Paste the verified 64-digit TLS fingerprint" }
-  val address = host.text.toString().trim(); require(address.isNotBlank() && address.length <= 253 && address.none { it.isWhitespace() || it.code < 32 }) { "Enter a valid computer address" }
-  val number = port.text.toString().toIntOrNull(); require(number != null && number in 1024..65535) { "Port must be between 1024 and 65535" }
+  val bluetooth = transportMode == "bluetooth"
+  val btAddress = bluetoothAddress.text.toString().trim().uppercase(java.util.Locale.ROOT)
+  if (transportMode != "lan") {
+   require(BluetoothSupport.validAddress(btAddress)) { "Choose your paired Bluetooth computer, or enter its address from Unity’s desktop Settings" }
+   if (!skipBluetoothPermission && Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { resumeBluetoothConnect = true; requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), BluetoothSupport.PERMISSION_REQUEST); return }
+   if (bluetooth) {
+    val adapter = BluetoothSupport.adapter(this) ?: error("This phone has no Bluetooth adapter")
+    if (!adapter.isEnabled) { resumeBluetoothConnect = true; startActivityForResult(Intent(android.bluetooth.BluetoothAdapter.ACTION_REQUEST_ENABLE), 22); return }
+   }
+  }
+  val address = host.text.toString().trim(); require(bluetooth || (address.isNotBlank() && address.length <= 253 && address.none { it.isWhitespace() || it.code < 32 })) { "Enter a valid computer address" }
+  val number = if (bluetooth) port.text.toString().toIntOrNull()?.takeIf { it in 1024..65535 } ?: prefs.getInt("port", 17161) else port.text.toString().toIntOrNull(); require(number != null && number in 1024..65535) { "Port must be between 1024 and 65535" }
   val oldPin = prefs.getString("fingerprint", null)
   if (oldPin != null && oldPin != pin) AlertDialog.Builder(this).setTitle("Replace your trusted computer?")
    .setMessage("This TLS identity differs from the saved computer. Verify the full new fingerprint on your computer. Continuing removes the old phone pairing credential and requires approval again.")
@@ -296,14 +365,39 @@ class MainActivity : Activity() {
   else saveConnection(address, number, pin)
  }
  private fun saveConnection(address: String, number: Int, pin: String) {
-  check(prefs.edit().putString("host", address).putInt("port", number).putString("fingerprint", pin).commit()) { "Could not save connection settings" }
-  if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS)) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+  check(prefs.edit().putString("host", address).putInt("port", number).putString("fingerprint", pin).putString("transport", transportMode).putString("bluetooth_address", bluetoothAddress.text.toString().trim().uppercase(java.util.Locale.ROOT)).commit()) { "Could not save connection settings" }
+  if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS) && !prefs.getBoolean("notification_permission_requested", false)) requestNotificationPermission()
   startForegroundService(Intent(this, CompanionService::class.java).setAction("connect")); select(Page.OVERVIEW)
+ }
+ private fun requestNotificationPermission() {
+  if (Build.VERSION.SDK_INT >= 33) {
+   prefs.edit().putBoolean("notification_permission_requested", true).apply()
+   requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+  }
+ }
+ private fun refreshConnectionFields() {
+  ui.describe(transportRow, when (transportMode) { "bluetooth" -> "Bluetooth only"; "lan" -> "Wi-Fi / LAN only"; else -> "Keep both connected · Bluetooth for controls, Wi-Fi / LAN for files and streams" })
+  if (::host.isInitialized) { host.isEnabled = transportMode != "bluetooth"; port.isEnabled = transportMode != "bluetooth" }
+  bluetoothAddress.isEnabled = transportMode != "lan"
+ }
+ private fun chooseBluetoothComputer() {
+  if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) { resumeBluetoothConnect = false; requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), BluetoothSupport.PERMISSION_REQUEST); return }
+  val adapter = BluetoothSupport.adapter(this) ?: error("This phone has no Bluetooth adapter")
+  if (!adapter.isEnabled) { resumeBluetoothConnect = false; startActivityForResult(Intent(android.bluetooth.BluetoothAdapter.ACTION_REQUEST_ENABLE), 22); return }
+  val devices = adapter.bondedDevices.sortedBy { it.name ?: it.address }
+  if (devices.isEmpty()) {
+   AlertDialog.Builder(this).setTitle("Pair your computer first").setMessage("Pair the phone and computer in system Bluetooth settings. Return here to choose the computer, then verify Unity’s TLS fingerprint.")
+    .setPositiveButton("Open Bluetooth settings") { _, _ -> settings(Settings.ACTION_BLUETOOTH_SETTINGS) }.setNegativeButton("Cancel", null).show(); return
+  }
+  AlertDialog.Builder(this).setTitle("Choose your computer").setItems(devices.map { "${it.name ?: "Bluetooth device"}\n${it.address}" }.toTypedArray()) { _, index ->
+   transportMode = if (host.text.isNotBlank()) "both" else "bluetooth"; bluetoothAddress.setText(devices[index].address); refreshConnectionFields()
+  }.setNegativeButton("Cancel", null).show()
  }
  private fun forgetComputer() {
   AlertDialog.Builder(this).setTitle("Forget this computer?").setMessage("The connection will stop and this phone’s saved pairing credential will be removed. Remove the phone from Unity on the computer to revoke its saved trust there too.")
    .setNegativeButton("Cancel", null).setPositiveButton("Forget") { _, _ -> safe {
-    stopService(Intent(this, CompanionService::class.java)); Credentials(this).clear(); prefs.edit().remove("host").remove("fingerprint").remove("port").apply()
+    stopService(Intent(this, CompanionService::class.java)); Credentials(this).clear(); prefs.edit().remove("host").remove("fingerprint").remove("port").remove("transport").remove("bluetooth_address").apply()
+    transportMode = "both"; bluetoothAddress.setText(""); refreshConnectionFields()
     host.setText(""); fingerprint.setText(""); port.setText(String.format(java.util.Locale.ROOT, "%d", 17161)); refreshState()
    } }.show()
  }
@@ -317,6 +411,7 @@ class MainActivity : Activity() {
   id == "notification_actions" && !prefs.getBoolean("enable.notifications", false) -> "Enable notification mirroring"
   id == "sms" && (!granted(Manifest.permission.READ_SMS) || !granted(Manifest.permission.SEND_SMS)) -> "Allow SMS permissions"
   id == "call_notifications" && !granted(Manifest.permission.READ_PHONE_STATE) -> "Allow phone permission"
+  id == "call_control" && !granted(Manifest.permission.CALL_PHONE) -> "Allow phone permission"
   id in listOf("photos", "browsing") && !prefs.getBoolean("enable.files", false) -> "Enable file transfers"
   id == "photos" && !photoGranted() -> "Choose which photos may be shared"
   id == "browsing" && !prefs.contains("tree") -> "Choose a shared folder"
@@ -351,7 +446,7 @@ class MainActivity : Activity() {
   service.event("urls", JSONObject().put("url", value)); message("Web page shared")
  }
  private fun handleIntent(intent: Intent?) {
-  when (intent?.getStringExtra("phone_action")) { "hotspot" -> safe { settings(Settings.ACTION_WIRELESS_SETTINGS) }; "clipboard", "url" -> select(Page.SHARING) }
+  when (intent?.getStringExtra("phone_action")) { "hotspot" -> safe { settings(Settings.ACTION_WIRELESS_SETTINGS) }; "clipboard", "url", "files" -> select(Page.SHARING) }
   if (intent?.action == Intent.ACTION_SEND) {
    select(Page.SHARING)
    val text = intent.getStringExtra(Intent.EXTRA_TEXT)
@@ -364,13 +459,23 @@ class MainActivity : Activity() {
  }
  override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
   super.onActivityResult(requestCode, resultCode, data); if (resultCode != RESULT_OK) return
+  if (requestCode == 22) { safe { if (resumeBluetoothConnect) connect() else chooseBluetoothComputer() }; return }
   val uri = data?.data ?: return
   safe { if (requestCode == 10) { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION); prefs.edit().putString("tree", uri.toString()).apply(); CompanionService.instance?.features?.publish(); refreshState(); message("Shared folder updated") } else if (requestCode == 11) sendFile(uri) }
  }
  override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); handleIntent(intent) }
- override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, results: IntArray) { super.onRequestPermissionsResult(code, permissions, results); CompanionService.instance?.features?.publish(); refreshState() }
+ override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, results: IntArray) {
+  super.onRequestPermissionsResult(code, permissions, results)
+  if (code == BluetoothSupport.PERMISSION_REQUEST) safe {
+   if (BluetoothSupport.allowed(this)) { if (resumeBluetoothConnect) connect() else chooseBluetoothComputer() }
+   else if (resumeBluetoothConnect && transportMode == "both") {
+    connect(skipBluetoothPermission = true); message("Wi-Fi / LAN can connect. Allow Nearby devices to also connect Bluetooth.")
+   } else message("Nearby devices permission is needed to connect over Bluetooth")
+  }
+  CompanionService.instance?.features?.publish(); refreshState()
+ }
  override fun onSaveInstanceState(out: Bundle) {
-  out.putString("page", selected.name); listOf("host" to host, "port" to port, "fingerprint" to fingerprint, "url" to url, "excluded" to excluded).forEach { (key, field) -> out.putString(key, field.text.toString()) }; super.onSaveInstanceState(out)
+  out.putString("transport", transportMode); out.putString("bluetooth_address", bluetoothAddress.text.toString()); out.putString("page", selected.name); listOf("host" to host, "port" to port, "fingerprint" to fingerprint, "url" to url, "excluded" to excluded).forEach { (key, field) -> out.putString(key, field.text.toString()) }; super.onSaveInstanceState(out)
  }
  override fun onStart() {
   super.onStart(); CompanionEvents.observe(stateChanged)
@@ -380,6 +485,7 @@ class MainActivity : Activity() {
   CompanionEvents.remove(stateChanged)
   prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged); pending.unregisterOnSharedPreferenceChangeListener(preferencesChanged); super.onStop()
  }
- override fun onResume() { super.onResume(); CompanionService.instance?.features?.publish(); refreshState() }
- companion object { private val sensitive = setOf("notifications", "notification_actions", "sms", "call_notifications", "clipboard", "files", "photos", "browsing", "media", "remote_input") }
+ override fun onPause() { resumed = false; super.onPause() }
+ override fun onResume() { super.onResume(); resumed = true; CompanionService.instance?.features?.publish(); refreshState() }
+ companion object { private val sensitive = setOf("notifications", "notification_actions", "sms", "call_notifications", "clipboard", "files", "photos", "browsing", "media", "audio", "remote_input", "lock", "screen") }
 }

@@ -6,7 +6,7 @@ impl Plugin for Feature {
     fn spec(&self) -> Spec {
         Spec {
             id: "connectivity",
-            title: "LAN connectivity",
+            title: "Wi-Fi and Bluetooth connectivity",
             group: "connectivity",
             sensitive: false,
             blocked: "",

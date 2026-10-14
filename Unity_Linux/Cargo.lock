@@ -1134,6 +1134,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "futures-lite",
  "hex",
  "libc",
  "rand",
@@ -1149,6 +1150,7 @@ dependencies = [
  "unity-security",
  "unity-transport",
  "uuid",
+ "zbus",
 ]
 
 [[package]]

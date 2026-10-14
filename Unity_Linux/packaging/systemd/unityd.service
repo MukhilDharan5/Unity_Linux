@@ -8,7 +8,8 @@ BusName=org.unityconnect
 ExecStart=@LIBEXEC@/unityd
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=10
+# Allow bounded audio commands to finish and restore Bluetooth profiles.
+TimeoutStopSec=60
 UMask=0077
 NoNewPrivileges=yes
 LockPersonality=yes

@@ -13,7 +13,15 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// Open the installed GTK client and grant access only to its verified child process.
-    LaunchGtk,
+    LaunchGtk {
+        /// Open only the live-call popup for this paired device.
+        #[arg(long, conflicts_with_all = ["open_messages", "open_notifications"])]
+        call_popup: Option<String>,
+        #[arg(long, conflicts_with = "open_notifications")]
+        open_messages: Option<String>,
+        #[arg(long)]
+        open_notifications: Option<String>,
+    },
     List,
     Status {
         device: String,
@@ -89,7 +97,40 @@ async fn main() -> Result<()> {
         .context("Could not connect to the session bus")?;
     let manager = zbus::Proxy::new(&bus, BUS, ROOT, "org.unityconnect.Manager1").await?;
     match a.cmd {
-        Command::LaunchGtk => gtk_launcher::launch(&bus, &manager).await?,
+        Command::LaunchGtk {
+            call_popup,
+            open_messages,
+            open_notifications,
+        } => {
+            let target = call_popup
+                .as_ref()
+                .map(|device| ("call-popup", device))
+                .or_else(|| {
+                    open_messages
+                        .as_ref()
+                        .map(|device| ("open-messages", device))
+                })
+                .or_else(|| {
+                    open_notifications
+                        .as_ref()
+                        .map(|device| ("open-notifications", device))
+                });
+            if let Some((_, device)) = target {
+                anyhow::ensure!(
+                    device.len() == 32
+                        && device
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+                    "invalid device ID"
+                );
+            }
+            gtk_launcher::launch(
+                &bus,
+                &manager,
+                target.map(|(option, device)| (option, device.as_str())),
+            )
+            .await?
+        }
         Command::List => {
             let paths: Vec<zbus::zvariant::OwnedObjectPath> =
                 manager.call("ListDevices", &()).await?;
@@ -213,7 +254,12 @@ async fn execute(
     let op = zbus::Proxy::new(bus, BUS, path, "org.unityconnect.Operation1").await?;
     // Subscribe before reading state so a completion signal cannot be missed.
     let mut changes = op.receive_signal("Changed").await?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(65);
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(if feature == "files" && action == "send" {
+            900
+        } else {
+            65
+        });
     loop {
         let s: String = op.call("GetState", &()).await?;
         let v: Value = serde_json::from_str(&s)?;

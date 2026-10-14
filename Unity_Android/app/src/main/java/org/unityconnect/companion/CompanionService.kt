@@ -2,6 +2,7 @@ package org.unityconnect.companion
 
 import android.app.*
 import android.content.*
+import android.content.pm.ServiceInfo
 import android.net.*
 import android.os.*
 import org.json.JSONObject
@@ -45,6 +46,7 @@ class CompanionService : Service() {
   val nm = getSystemService(NotificationManager::class.java)
   nm.createNotificationChannel(NotificationChannel("unity.connection", "Device connection", NotificationManager.IMPORTANCE_LOW))
   nm.createNotificationChannel(NotificationChannel("unity.actions", "Phone actions", NotificationManager.IMPORTANCE_DEFAULT))
+  ReceivedItems.channel(this)
   credentials = Credentials(this); features = FeatureRegistry(this); connection = Connection(this)
   val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED).apply { addAction("android.intent.action.PHONE_STATE") }
   if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, RECEIVER_EXPORTED) else registerReceiver(receiver, filter)
@@ -52,7 +54,7 @@ class CompanionService : Service() {
  }
  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
   if (intent?.action == "stop") { stopSelf(); return START_NOT_STICKY }
-  startForeground(1, notification(uiState.title))
+  startForeground(1, notification(uiState.title), foregroundTypes())
   if (intent?.action != "refresh") status("Connecting to your saved computer…", ConnectionPhase.CONNECTING)
   if (intent?.action == "refresh") features.publish() else if (intent != null) { connection.stop(); connection = Connection(this); connection.start() }
   // START_STICKY restores saved settings after process termination, subject to Android OEM limits.
@@ -65,6 +67,18 @@ class CompanionService : Service() {
    .setContentTitle("Unity").setContentText(text).setContentIntent(open).setOngoing(true).build()
  }
  fun uiChanged() { CompanionEvents.changed() }
+ private fun foregroundTypes() = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+  (if (features.audio.active()) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0) or
+  (if (features.screen.projectionForeground) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0)
+ fun refreshForeground() {
+  val update = Runnable { if (instance === this) startForeground(1, notification(when {
+   features.screen.projectionForeground -> "Sharing phone screen"
+   features.audio.active() -> "Playing laptop audio"
+   else -> uiState.title
+  }), foregroundTypes()) }
+  if (Looper.myLooper() == Looper.getMainLooper()) update.run() else Handler(Looper.getMainLooper()).post(update)
+ }
+ fun audioPlaybackChanged() { refreshForeground() }
  fun sendFile(uri: Uri) {
   check(connection.ready) { "Connect first" }
   check(features.files.capability().getString("status") == "available") { "Enable file transfers in Features" }
@@ -99,7 +113,8 @@ class CompanionService : Service() {
     val feature = message.getString("feature"); val action = message.getString("action"); val data = message.getJSONObject("data")
     val module = features.modules[feature] ?: error("Unsupported feature")
     val cap = module.capability()
-    check(cap.getString("status") in listOf("available", "user_action_required")) { cap.getString("reason") }
+    check((feature in listOf("audio", "screen") && action == "stop") || cap.getString("status") in listOf("available", "user_action_required")) { cap.getString("reason") }
+    if (feature in listOf("audio", "screen") && action == "start") require(data.getString("request_id") == id)
     val response = module.command(action, data)
     if (response != null) result(id, true, response)
    } catch (e: Exception) { result(id, false, error = e.message ?: "Phone operation failed") }
@@ -117,7 +132,7 @@ class CompanionService : Service() {
  }
  override fun onBind(intent: Intent?) = null
  override fun onDestroy() {
-  instance = null; connection.stop(); features.disconnected(); features.media.close(); commands.shutdownNow(); transfers.shutdownNow()
+  instance = null; connection.stop(); features.disconnected(); features.media.close(); features.sms.close(); commands.shutdownNow(); transfers.shutdownNow()
   uiState = ConnectionState.disconnected; uiChanged()
   unregisterReceiver(receiver); getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback)
   super.onDestroy()

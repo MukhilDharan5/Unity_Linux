@@ -63,7 +63,8 @@ class Launcher(unittest.TestCase):
 
     def start_daemon(self):
         self.daemon = subprocess.Popen([self.prefix / 'libexec/unity/unityd', '--state-dir', self.dir / 'state',
-            '--bind', '127.0.0.1', '--port', str(self.port)], stdout=self.log, stderr=self.log)
+            '--bind', '127.0.0.1', '--port', str(self.port)], stdout=self.log, stderr=self.log,
+            env=dict(os.environ, UNITY_TEST_ACCESS_STATE=str(self.state), DISPLAY='test-only'))
         # Do not activate a production installation on the isolated test bus.
         wait_for(lambda: BUS in self.bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
             'org.freedesktop.DBus', 'ListNames', None, None, Gio.DBusCallFlags.NONE, 1000, None).unpack()[0])
@@ -81,9 +82,9 @@ class Launcher(unittest.TestCase):
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
-    def launch(self):
+    def launch(self, *options):
         self.state.unlink(missing_ok=True)
-        self.launcher = subprocess.Popen([self.prefix / 'bin/unity-gtk'],
+        self.launcher = subprocess.Popen([self.prefix / 'bin/unityctl', 'launch-gtk', *options],
             env=dict(os.environ, UNITY_TEST_ACCESS_STATE=str(self.state)), stdout=self.log, stderr=self.log)
         return wait_for(lambda: self.status() if self.status().get('approved') else None)
 
@@ -126,7 +127,8 @@ class Launcher(unittest.TestCase):
         os.kill(first['pid'], signal.SIGTERM)
         self.assertEqual(self.launcher.wait(timeout=5), 0)
         self.assertIsNone(self.daemon.poll())
-        second = self.launch()
+        second = self.launch('--call-popup', 'ab' * 16)
+        self.assertEqual(second['arguments'], ['--call-popup=' + 'ab' * 16])
         self.assertNotEqual(first['bus_name'], second['bus_name'])
         self.assertNotEqual(first['pid'], second['pid'])
         wait_for(lambda: all(c['bus_name'] != first['bus_name'] for c in json.loads(self.cli('clients').stdout)))
@@ -134,6 +136,47 @@ class Launcher(unittest.TestCase):
         self.assertEqual(self.launcher.wait(timeout=5), 0)
         self.assertIsNone(self.daemon.poll())
         self.assertEqual(json.loads(self.cli('diagnose').stdout)['api_version'], 1)
+        for option in ('--open-messages','--open-notifications'):
+            opened=self.launch(option,'ab'*16)
+            self.assertEqual(opened['arguments'],[option+'='+'ab'*16])
+            os.kill(opened['pid'],signal.SIGTERM);self.assertEqual(self.launcher.wait(timeout=5),0)
+        invalid = subprocess.run([self.prefix / 'bin/unityctl', 'launch-gtk', '--call-popup', '../other'], capture_output=True, text=True)
+        self.assertNotEqual(invalid.returncode, 0)
+
+    def test_live_call_automatically_launches_verified_popup_when_app_is_closed(self):
+        import integration as h
+        from fake_notifications import FakeNotifications
+        notices = FakeNotifications()
+        peer = None
+        client = None
+        try:
+            info = json.loads(self.cli('discover').stdout)
+            peer = h.Peer(self.port, info['fingerprint'])
+            self.cli('pair', h.DEVICE)
+            secret = peer.read()['secret']; peer.close()
+            peer = h.Peer(self.port, info['fingerprint'], secret)
+            call = {'id': 'ab' * 16, 'state': 'ringing', 'number': '15550123', 'name': 'Test caller', 'connect_time': 0, 'can_hold': True, 'conference': False}
+            state = {'backend': 'android_telecom', 'calls': [call], 'muted': False, 'route': 'phone', 'routes': ['phone', 'speaker']}
+            peer.event('call_control', state)
+            client = wait_for(lambda: self.status() if self.status().get('approved') else None)
+            self.assertEqual(client['arguments'], ['--call-popup=' + h.DEVICE])
+            self.assertNotEqual(client['pid'], self.daemon.pid)
+            call.update(state='active', connect_time=1791900000000)
+            peer.event('call_control', state)
+            wait_for(lambda: any(n['title'] == 'Call in progress' for n in notices.items))
+            self.assertEqual(self.status()['pid'], client['pid'], 'State changes must not repeatedly launch popups')
+            for _ in range(3):
+                state['calls'] = []; peer.event('call_control', state)
+                time.sleep(.6)
+                state['calls'] = [call]; peer.event('call_control', state)
+                time.sleep(.2)
+                self.assertEqual(self.status()['pid'], client['pid'], 'Brief empty snapshots must not relaunch the client')
+            clients = [c for c in json.loads(self.cli('clients').stdout) if c['name'] == 'Unity GTK']
+            self.assertEqual(len(clients), 1, clients)
+        finally:
+            if peer: peer.close()
+            if client: os.kill(client['pid'], signal.SIGTERM)
+            notices.close()
 
 
 if __name__ == '__main__':

@@ -32,7 +32,10 @@ async fn main() -> Result<()> {
         port = a.port,
         "Unity daemon ready; pairing is closed until requested through D-Bus"
     );
-    tokio::select! {result=engine.serve(&a.bind)=>result?,_=tokio::signal::ctrl_c()=>{},_=terminate()=>{}}
+    tokio::select! {result=engine.clone().serve(&a.bind)=>result?,_=tokio::signal::ctrl_c()=>{},_=terminate()=>{}}
+    engine.shutdown_calls().await;
+    engine.shutdown_screens().await;
+    engine.shutdown_audio().await;
     Ok(())
 }
 async fn terminate() {

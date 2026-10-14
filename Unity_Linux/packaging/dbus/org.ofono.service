@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=org.ofono
+Exec=/usr/sbin/ofonod -n
+User=root
+SystemdService=ofono.service

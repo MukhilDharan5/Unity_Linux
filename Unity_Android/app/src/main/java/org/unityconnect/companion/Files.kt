@@ -2,14 +2,18 @@ package org.unityconnect.companion
 
 import android.Manifest
 import android.content.ContentUris
+import android.content.ContentResolver
+import android.content.ContentValues
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Base64
 import android.util.Size
+import android.webkit.MimeTypeMap
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -17,6 +21,29 @@ import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+
+/** Publish only a hash-verified file; failed writes never expose partial downloads. */
+internal fun saveDownload(resolver: ContentResolver, file: File, name: String): Uri {
+ require(Protocol.safeName(name)) { "Invalid file name" }
+ val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase()) ?: "application/octet-stream"
+ val values = ContentValues().apply {
+  put(MediaStore.Downloads.DISPLAY_NAME, name)
+  put(MediaStore.Downloads.MIME_TYPE, mime)
+  put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/Unity")
+  put(MediaStore.Downloads.IS_PENDING, 1)
+ }
+ val uri = resolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
+  ?: error("Could not create file in Downloads/Unity")
+ try {
+  resolver.openOutputStream(uri, "w")?.use { output -> file.inputStream().use { it.copyTo(output, 49152) } }
+   ?: error("Could not write file in Downloads/Unity")
+  check(resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null) == 1) { "Could not publish downloaded file" }
+  return uri
+ } catch (e: Exception) {
+  runCatching { resolver.delete(uri, null, null) }
+  throw e
+ }
+}
 
 class FileFeature(service: CompanionService) : Module(service, "files") {
  private data class Incoming(val file: File, val stream: FileOutputStream, val name: String, val size: Long,
@@ -46,9 +73,9 @@ class FileFeature(service: CompanionService) : Module(service, "files") {
     try {
      t.stream.fd.sync(); t.stream.close()
      check(t.count == t.size && Protocol.hex(t.hash.digest()) == t.digest) { "File integrity check failed" }
-     val destination = File(t.file.parentFile, "$transfer-${t.name}")
-     check(!destination.exists() && t.file.renameTo(destination))
-     return JSONObject().put("state", "received").put("name", t.name).put("size", t.size)
+     val uri = saveDownload(service.contentResolver, t.file, t.name)
+     ReceivedItems.file(service, uri, t.name)
+     return JSONObject().put("state", "received").put("name", t.name).put("size", t.size).put("location", "Downloads/Unity")
     } finally { t.stream.close(); if (t.file.exists()) t.file.delete() }
    }
    "abort" -> { incoming.remove(transfer)?.let { it.stream.close(); it.file.delete() } }
@@ -56,22 +83,41 @@ class FileFeature(service: CompanionService) : Module(service, "files") {
   }
   return null // A single operation result is emitted after verified completion.
  }
+ @Synchronized fun abort(id: String) { incoming.remove(id)?.let { runCatching { it.stream.close(); it.file.delete() } } }
  @Synchronized fun abortAll() { incoming.values.forEach { runCatching { it.stream.close(); it.file.delete() } }; incoming.clear() }
  fun send(uri: Uri): JSONObject {
   check(capability().getString("status") == "available") { "Enable file sharing on phone" }
   val resolver = service.contentResolver
-  var name = "shared-file"
+  var name = uri.lastPathSegment?.substringAfterLast('/') ?: "shared-file"
   resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { if (it.moveToFirst()) name = it.getString(0) ?: name }
-  require(Protocol.safeName(name))
-  var size = 0L; val hash = MessageDigest.getInstance("SHA-256"); val buffer = ByteArray(49152)
-  resolver.openInputStream(uri)?.use { input -> while (true) { val n = input.read(buffer); if (n < 0) break; size += n; require(size <= Protocol.MAX_FILE); hash.update(buffer, 0, n) } } ?: error("File unavailable")
+  require(Protocol.safeName(name)) { "Rename this file before sending" }
+  val snapshot = File.createTempFile("unity-send-", ".part", service.cacheDir)
   val transfer = UUID.randomUUID().toString().replace("-", "")
-  service.event(id, JSONObject().put("phase", "begin").put("id", transfer).put("name", name).put("size", size).put("sha256", Protocol.hex(hash.digest())), true)
-  resolver.openInputStream(uri)?.use { input -> while (true) { val n = input.read(buffer); if (n < 0) break;
-   service.event(id, JSONObject().put("phase", "chunk").put("id", transfer).put("data", Base64.encodeToString(buffer.copyOf(n), Base64.NO_WRAP)), true)
-  } } ?: error("File unavailable")
-  service.event(id, JSONObject().put("phase", "end").put("id", transfer), true)
-  return JSONObject().put("state", "transferred").put("transfer_id", transfer)
+  var began = false
+  var transferSender: ((JSONObject) -> Unit)? = null
+  try {
+   // Document providers may return a one-shot stream or change between opens.
+   // Hash and send the same bounded local snapshot, opening the URI only once.
+   var size = 0L; val hash = MessageDigest.getInstance("SHA-256"); val buffer = ByteArray(49152)
+   resolver.openInputStream(uri)?.use { input -> snapshot.outputStream().use { output ->
+    while (true) { val n = input.read(buffer); if (n < 0) break; size += n
+     require(size <= Protocol.MAX_FILE) { "File exceeds the 64 MiB limit" }
+     output.write(buffer, 0, n); hash.update(buffer, 0, n)
+    }
+   } } ?: error("File unavailable")
+   val send = service.connection.fileSender()
+   transferSender = send
+   send(JSONObject().put("phase", "begin").put("id", transfer).put("name", name).put("size", size).put("sha256", Protocol.hex(hash.digest())))
+   began = true
+   snapshot.inputStream().use { input -> while (true) { val n = input.read(buffer); if (n < 0) break
+    send(JSONObject().put("phase", "chunk").put("id", transfer).put("data", Base64.encodeToString(buffer.copyOf(n), Base64.NO_WRAP)))
+   } }
+   send(JSONObject().put("phase", "end").put("id", transfer))
+   return JSONObject().put("state", "transferred").put("transfer_id", transfer)
+  } catch (e: Exception) {
+   if (began) runCatching { transferSender?.invoke(JSONObject().put("phase", "abort").put("id", transfer)) }
+   throw e
+  } finally { snapshot.delete() }
  }
 }
 class PhotoFeature(service: CompanionService) : Module(service, "photos") {

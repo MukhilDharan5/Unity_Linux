@@ -23,7 +23,7 @@ interface Feature {
 abstract class Module(protected val service: CompanionService, final override val id: String) : Feature {
  protected fun granted(permission: String) = service.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
  protected fun enabled() = service.getSharedPreferences("settings", 0).getBoolean("enable.$id", !sensitive())
- private fun sensitive() = id in listOf("notifications", "notification_actions", "sms", "call_notifications", "clipboard", "files", "photos", "browsing", "media", "remote_input")
+ private fun sensitive() = id in listOf("notifications", "notification_actions", "sms", "call_notifications", "call_control", "clipboard", "files", "photos", "browsing", "media", "audio", "remote_input", "lock", "screen")
  protected fun status(ok: Boolean = true, reason: String = "") = when {
   !enabled() -> cap(id, "disabled", "Enable this feature on your phone")
   !ok -> cap(id, "permission_required", reason)
@@ -32,6 +32,7 @@ abstract class Module(protected val service: CompanionService, final override va
  override fun capability() = status()
  override fun command(action: String, data: JSONObject): JSONObject? { error("Unsupported action") }
  protected fun onMain(block: () -> JSONObject): JSONObject {
+  if (Looper.myLooper() == Looper.getMainLooper()) return block()
   val future = CompletableFuture<JSONObject>()
   Handler(Looper.getMainLooper()).post { try { future.complete(block()) } catch (e: Exception) { future.completeExceptionally(e) } }
   return future.get(5, TimeUnit.SECONDS)
@@ -43,13 +44,39 @@ class Unsupported(service: CompanionService, id: String, private val reason: Str
 class LocalFeature(service: CompanionService, id: String) : Module(service, id)
 
 class Battery(service: CompanionService) : Module(service, "battery") {
+ private val manager = service.getSystemService(BatteryManager::class.java)
+ private val estimator = BatteryEstimator()
+ private val main = Handler(Looper.getMainLooper())
+ private var watching = false
+ private val update = object : Runnable {
+  override fun run() {
+   if (!watching) return
+   if (!service.connection.ready || !enabled()) { stop(); return }
+   publish()
+   main.postDelayed(this, 30_000)
+  }
+ }
+ fun watch() { main.post { if (!watching) { watching = true; main.postDelayed(update, 30_000) } } }
+ fun stop() { main.post { watching = false; main.removeCallbacks(update); estimator.reset() } }
  fun publish(intent: Intent? = null) {
   if (capability().getString("status") != "available" || !service.connection.ready) return
   val i = intent ?: service.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return
   val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1); val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-  if (level < 0 || scale <= 0) return
+  if (level < 0 || scale <= 0 || level > scale) return
   val state = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-  runCatching { service.event(id, JSONObject().put("level", (level * 100 / scale).coerceIn(0, 100)).put("charging", state == BatteryManager.BATTERY_STATUS_CHARGING || state == BatteryManager.BATTERY_STATUS_FULL)) }
+  val status = when (state) {
+   BatteryManager.BATTERY_STATUS_CHARGING -> "charging"
+   BatteryManager.BATTERY_STATUS_DISCHARGING -> "discharging"
+   BatteryManager.BATTERY_STATUS_FULL -> "full"
+   BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "not_charging"
+   else -> "unknown"
+  }
+  fun property(id: Int) = runCatching { manager.getIntProperty(id) }.getOrDefault(Int.MIN_VALUE)
+  val reading = BatteryReading((level.toLong() * 100 / scale).toInt(), status,
+   i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0, i.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0),
+   property(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW), property(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE),
+   property(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER), runCatching { manager.computeChargeTimeRemaining() }.getOrDefault(-1))
+  runCatching { service.event(id, estimator.sample(reading, SystemClock.elapsedRealtime())) }
  }
  override fun command(action: String, data: JSONObject): JSONObject { require(action == "refresh"); publish(); return JSONObject().put("state", "refreshed") }
 }
@@ -86,16 +113,16 @@ class ClipboardFeature(service: CompanionService) : Module(service, "clipboard")
   require(action == "set"); val text = data.getString("text"); require(text.toByteArray().size <= 64 * 1024 - 256)
   service.getSharedPreferences("pending", 0).edit().putString("clipboard", text).commit()
   service.uiChanged()
-  service.prompt("Text received from your computer", "clipboard")
-  return JSONObject().put("state", "user_action_required").put("reason", "Open Unity on phone and tap Apply received clipboard")
+  ReceivedItems.text(service, text)
+  return JSONObject().put("state", "user_action_required").put("reason", "Tap the received text notification to open or copy it")
  }
 }
 class UrlFeature(service: CompanionService) : Module(service, "urls") {
  override fun command(action: String, data: JSONObject): JSONObject {
   require(action == "open"); val value = data.getString("url"); val uri = Uri.parse(value)
   require(value.length <= 8192 && uri.scheme in listOf("http", "https") && !uri.host.isNullOrBlank() && value.none { it.code < 32 })
-  service.getSharedPreferences("pending", 0).edit().putString("url", value).commit(); service.uiChanged(); service.prompt("Web page received", "url")
-  return JSONObject().put("state", "user_action_required").put("reason", "Open the shared URL on your phone")
+  service.getSharedPreferences("pending", 0).edit().putString("url", value).commit(); service.uiChanged(); ReceivedItems.link(service, value)
+  return JSONObject().put("state", "user_action_required").put("reason", "Tap the received link notification to open it")
  }
 }
 class RingerFeature(service: CompanionService) : Module(service, "ringer") {
@@ -137,24 +164,29 @@ class FeatureRegistry(val service: CompanionService) {
  val battery = Battery(service)
  val network = NetworkStatus(service)
  val calls = CallNotifications(service)
+ val callControl = CallControl(service)
  val files = FileFeature(service)
  val find = FindFeature(service)
  val media = MediaFeature(service)
+ val audio = AudioRouting(service)
+ val lock = DeviceLock(service)
+ val screen = ScreenSharing(service)
  val sms = SmsFeature(service)
  val modules: Map<String, Feature> = listOf(
   LocalFeature(service, "pairing"), LocalFeature(service, "reconnect"), battery, network,
-  object : Module(service, "connectivity") { override fun capability() = cap(id, reason = "Authenticated LAN; BLE control channel is not implemented") },
+  object : Module(service, "connectivity") { override fun capability() = cap(id, reason = "Pinned TLS over simultaneous Bluetooth and Wi-Fi / LAN connections") },
   NotificationFeature(service), NotificationActions(service), sms, calls,
-  Unsupported(service, "call_control", "Requires complete default dialer and InCallService; not implemented"),
-  ClipboardFeature(service), files, PhotoFeature(service), UrlFeature(service), BrowseFeature(service), media,
+  callControl,
+  ClipboardFeature(service), files, PhotoFeature(service), UrlFeature(service), BrowseFeature(service), media, audio, lock, screen,
   RingerFeature(service), find, RemoteInputFeature(service),
-  Unsupported(service, "screen", "MediaProjection capture, encoding and rendering are not implemented"), HotspotFeature(service)
+  HotspotFeature(service)
  ).associateBy { it.id }
  fun capabilities() = JSONArray(modules.values.map { it.capability() })
  fun publish() {
+  audio.settingsChanged(); screen.settingsChanged()
   if (!service.connection.ready) return
   service.connection.send(JSONObject().put("type", "capabilities").put("capabilities", capabilities()))
-  battery.publish(); network.watch(); network.publish(); media.watch(); sms.watch(); PhoneNotifications.instance?.publishAll()
+  battery.publish(); battery.watch(); network.watch(); network.publish(); media.watch(); sms.watch(); callControl.publish(); PhoneNotifications.instance?.publishAll()
  }
- fun disconnected() { files.abortAll(); find.stop(); media.stop(); sms.stop(); network.stop() }
+ fun disconnected() { battery.stop(); audio.stop(); screen.stop(); files.abortAll(); find.stop(); media.stop(); sms.stop(); network.stop() }
 }

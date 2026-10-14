@@ -2,6 +2,7 @@
 use anyhow::{bail, Result};
 use serde_json::Value;
 use unity_protocol::{Availability, Capability, MAX_TEXT};
+pub mod audio;
 pub mod battery;
 pub mod browsing;
 pub mod call_control;
@@ -11,6 +12,7 @@ pub mod connectivity;
 pub mod files;
 pub mod find;
 pub mod hotspot;
+pub mod lock;
 pub mod media;
 pub mod network;
 pub mod notification_actions;
@@ -58,6 +60,8 @@ pub fn registry() -> Vec<Box<dyn Plugin>> {
         Box::new(urls::Feature),
         Box::new(browsing::Feature),
         Box::new(media::Feature),
+        Box::new(audio::Feature),
+        Box::new(lock::Feature),
         Box::new(ringer::Feature),
         Box::new(find::Feature),
         Box::new(remote_input::Feature),
@@ -134,13 +138,7 @@ pub fn validate_command(s: Spec, a: &str, v: &Value) -> Result<()> {
         }
         ("sms", "send") => {
             let address = text(v, "address", 64)?;
-            if address.is_empty()
-                || !address
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || "+ -()".contains(c))
-            {
-                bail!("invalid phone number")
-            };
+            call_control::number(address)?;
             if text(v, "body", 4096)?.is_empty() {
                 bail!("empty message")
             }
@@ -148,6 +146,13 @@ pub fn validate_command(s: Spec, a: &str, v: &Value) -> Result<()> {
         ("sms", "list") => {
             if v.get("address").is_some() {
                 text(v, "address", 256)?;
+            }
+            for (key, min, max) in [("offset", 0, 100_000), ("limit", 1, 100)] {
+                if let Some(n) = v.get(key) {
+                    if !n.as_u64().is_some_and(|n| n >= min && n <= max) {
+                        bail!("invalid message page")
+                    }
+                }
             }
         }
         ("notification_actions", "reply") => {
@@ -214,6 +219,7 @@ pub fn validate_event(id: &str, v: &Value) -> Result<()> {
             if !v["charging"].is_boolean() {
                 bail!("missing charging state")
             }
+            battery::validate_telemetry(v)?;
         }
         "network" => {
             text(v, "kind", 32)?;
@@ -223,6 +229,12 @@ pub fn validate_event(id: &str, v: &Value) -> Result<()> {
         }
         "notifications" => {
             text(v, "id", 512)?;
+            if v.get("alert").is_some_and(|v| !v.is_boolean()) {
+                bail!("invalid notification alert state")
+            }
+            if let Some(id) = v.get("sms_id") {
+                sms_inbox_id(id)?;
+            }
             if !v["removed"].as_bool().unwrap_or(false) {
                 text(v, "app", 256)?;
                 text(v, "title", 512)?;
@@ -274,10 +286,48 @@ pub fn validate_event(id: &str, v: &Value) -> Result<()> {
             text(v, "phase", 16)?;
             text(v, "id", 32)?;
         }
-        "sms" | "photos" | "browsing" => {}
+        "sms" => {
+            if !v["revision"].is_u64() {
+                bail!("missing message revision")
+            }
+            if v.get("message_id").is_some()
+                && (!unity_protocol::valid_id(text(v, "message_id", 32)?)
+                    || ![
+                        "submitted_to_modem",
+                        "sent",
+                        "delivered",
+                        "failed",
+                        "delivery_failed",
+                    ]
+                    .contains(&text(v, "state", 32)?))
+            {
+                bail!("invalid message report")
+            }
+            if let Some(incoming) = v.get("incoming") {
+                sms_inbox_id(&incoming["id"])?;
+                text(incoming, "address", 256)?;
+                text(incoming, "body", 4096)?;
+                if !incoming["timestamp"]
+                    .as_u64()
+                    .is_some_and(|t| t < 32_503_680_000_000)
+                {
+                    bail!("invalid incoming message timestamp")
+                }
+            }
+        }
+        "photos" | "browsing" => {}
         _ => {
             bail!("feature does not accept events")
         }
+    }
+    Ok(())
+}
+fn sms_inbox_id(v: &Value) -> Result<()> {
+    if !v
+        .as_str()
+        .is_some_and(|s| !s.is_empty() && s.len() <= 20 && s.bytes().all(|c| c.is_ascii_digit()))
+    {
+        bail!("invalid SMS inbox ID")
     }
     Ok(())
 }
@@ -287,7 +337,7 @@ mod tests {
     use serde_json::json;
     #[test]
     fn all_requirements_have_modules() {
-        assert_eq!(registry().len(), 21);
+        assert_eq!(registry().len(), 23);
         let mut ids = std::collections::HashSet::new();
         for p in registry() {
             assert!(ids.insert(p.spec().id));
@@ -295,9 +345,12 @@ mod tests {
     }
     #[test]
     fn unavailable_stays_unavailable() {
-        let c = capabilities(&[Capability::available("screen")]);
+        let c = capabilities(&[Capability::unsupported(
+            "call_control",
+            "Dialer permission required",
+        )]);
         assert_eq!(
-            c.iter().find(|c| c.id == "screen").unwrap().status,
+            c.iter().find(|c| c.id == "call_control").unwrap().status,
             Availability::Unsupported
         );
     }
@@ -321,5 +374,22 @@ mod tests {
         for p in registry() {
             assert!(p.command("invalid", &json!({})).is_err());
         }
+    }
+    #[test]
+    fn incoming_sms_and_notification_alert_metadata_are_bounded() {
+        let sms = json!({"revision":1,"incoming":{"id":"42","address":"Sender","body":"Hello","timestamp":1000}});
+        assert!(validate_event("sms", &sms).is_ok());
+        for value in [
+            json!({"revision":1,"incoming":{"id":"../42","address":"Sender","body":"Hello","timestamp":1000}}),
+            json!({"revision":1,"incoming":{"id":"42","address":"Sender","body":"Hello","timestamp":-1}}),
+            json!({"revision":1,"incoming":{"id":"42","address":"Sender","body":"x".repeat(4097),"timestamp":1000}}),
+        ] {
+            assert!(validate_event("sms", &value).is_err());
+        }
+        let notification = json!({"id":"post","app":"chat","title":"Alex","text":"Hello","removed":false,"alert":false,"sms_id":"42"});
+        assert!(validate_event("notifications", &notification).is_ok());
+        let mut invalid = notification;
+        invalid["alert"] = json!("true");
+        assert!(validate_event("notifications", &invalid).is_err());
     }
 }

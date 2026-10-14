@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.RemoteInput
 import android.content.Intent
 import android.os.Bundle
+import android.os.Build
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import org.json.JSONArray
@@ -16,13 +17,13 @@ class PhoneNotifications : NotificationListenerService() {
  override fun onListenerDisconnected() { instance = null; CompanionService.instance?.features?.publish() }
  override fun onDestroy() { instance = null; events.shutdownNow(); super.onDestroy() }
  private fun enabled() = getSharedPreferences("settings", 0).getBoolean("enable.notifications", false)
- override fun onNotificationPosted(sbn: StatusBarNotification) { publish(sbn) }
+ override fun onNotificationPosted(sbn: StatusBarNotification) { publish(sbn, true) }
  override fun onNotificationRemoved(sbn: StatusBarNotification) {
   if (!enabled()) return
   events.execute { runCatching { CompanionService.instance?.event("notifications", JSONObject().put("id", sbn.key.take(512)).put("removed", true), true) } }
  }
- fun publishAll() { if (enabled()) runCatching { activeNotifications?.take(200)?.forEach(::publish) } }
- private fun publish(sbn: StatusBarNotification) {
+ fun publishAll() { if (enabled()) runCatching { activeNotifications?.take(200)?.forEach { publish(it, false) } } }
+ private fun publish(sbn: StatusBarNotification, alert: Boolean) {
   if (!enabled() || sbn.packageName == packageName) return
   val excluded = getSharedPreferences("settings", 0).getString("notification_excluded", "")!!.split(',').map { it.trim() }
   if (sbn.packageName in excluded) return
@@ -35,7 +36,14 @@ class PhoneNotifications : NotificationListenerService() {
    .put("title", Protocol.text(n.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: "", 512))
    .put("text", Protocol.text((n.extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: n.extras.getCharSequence(Notification.EXTRA_TEXT))?.toString() ?: "", 8192))
    .put("actions", actions).put("removed", false)
-  events.execute { runCatching { CompanionService.instance?.event("notifications", value, true) } }
+   .put("alert", alert && !sbn.isOngoing && n.flags and Notification.FLAG_GROUP_SUMMARY == 0)
+  events.execute { runCatching {
+   val service = CompanionService.instance ?: return@runCatching
+   val message = if (Build.VERSION.SDK_INT >= 30) Notification.MessagingStyle.Message.getMessagesFromBundleArray(n.extras.getParcelableArray(Notification.EXTRA_MESSAGES)).lastOrNull() else null
+   val body = message?.text?.toString() ?: (n.extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: n.extras.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
+   service.features.sms.notificationMessageId(sbn.packageName, message?.timestamp ?: n.`when`, body)?.let { value.put("sms_id", it) }
+   if (enabled() && service.connection.ready) service.event("notifications", value, true)
+  } }
  }
  fun action(key: String, index: Int, reply: String?) {
   val n = activeNotifications?.firstOrNull { it.key == key } ?: error("Notification no longer exists")

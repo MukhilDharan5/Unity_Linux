@@ -3,9 +3,13 @@
 import base64
 import datetime
 import json
+import math
 from pathlib import Path
 import shutil
 import signal
+import stat
+import sys
+import time
 import gi
 
 gi.require_version('Gtk', '4.0')
@@ -14,6 +18,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GLibUnix, Gtk, Pango
 
 BUS = 'org.unityconnect'
 ROOT = '/org/unityconnect/Manager'
+MAX_FILE = 64 * 1024 * 1024
 
 CSS = '''
 .unity-content { padding: 24px; }
@@ -80,6 +85,19 @@ def size_text(value):
         value /= 1024
 
 
+def battery_time_text(seconds):
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or not math.isfinite(seconds) or seconds < 0:
+        return None
+    if seconds < 60:
+        return 'Less than a minute'
+    minutes = int(seconds / 60)
+    days, hours = divmod(minutes // 60, 24)
+    if days:
+        return f'{days} d {hours} h'
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours} h {minutes} min' if hours else f'{minutes} min'
+
+
 def image_texture(image):
     """Decode only bounded, daemon-validated JPEG data; never fetch remote URLs."""
     if not image or image.get('mime') != 'image/jpeg':
@@ -137,6 +155,8 @@ class Client:
     def _signal(self, bus, sender, path, interface, signal, parameters):
         if interface == 'org.unityconnect.Manager1' and signal == 'Changed':
             self.changed(parameters.unpack()[0])
+        elif interface == 'org.unityconnect.Screen1' and signal == 'FrameAvailable':
+            self.changed('screen-frame:' + path)
         elif interface == 'org.freedesktop.DBus.Properties':
             self.changed(path)
 
@@ -158,6 +178,114 @@ class Client:
         self.call(ROOT, 'org.unityconnect.Manager1', method, signature, args, done)
 
 
+def call_duration(seconds):
+    seconds = max(0, int(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes:02d}:{seconds:02d}'
+
+
+class CallPanel(Gtk.Box):
+    """The app and desktop popup share the same call actions and audio routing."""
+    def __init__(self, owner, computer_selectors=False):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.owner, self.signature, self.timers = owner, None, []
+        self.cards = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.append(self.cards)
+        self.audio_group = Adw.PreferencesGroup()
+        self.append(self.audio_group)
+        self.route_row = Adw.ActionRow(title='Call audio')
+        self.route_row.set_subtitle_lines(3)
+        self.route_button = Gtk.MenuButton(label='Phone', valign=Gtk.Align.CENTER)
+        self.route_row.add_suffix(self.route_button)
+        self.audio_group.add(self.route_row)
+        self.mute_button = Gtk.Button(label='Mute', valign=Gtk.Align.CENTER)
+        self.mute_button.connect('clicked', lambda *_: owner.execute('call_control', 'mute', {'muted': not owner.call_control_state.get('muted', False)}))
+        mute_row = Adw.ActionRow(title='Microphone'); mute_row.add_suffix(self.mute_button)
+        self.audio_group.add(mute_row)
+        self.output = self.microphone = None
+        if computer_selectors:
+            self.output = Adw.ComboRow(title='Computer output', model=Gtk.StringList.new(['System default']))
+            self.microphone = Adw.ComboRow(title='Computer microphone', model=Gtk.StringList.new(['System default']))
+            for field, row in [('output', self.output), ('microphone', self.microphone)]:
+                row.connect('notify::selected', owner.select_call_audio_device, field)
+                self.audio_group.add(row)
+            refresh = icon_button('view-refresh-symbolic', 'Refresh computer audio devices', owner.refresh_call_audio_devices, 'flat')
+            self.route_row.add_suffix(refresh)
+
+    def render(self, control, audio):
+        owner = self.owner
+        calls = control.get('calls', []) if owner.enabled('call_control') else []
+        ready = not control.get('reconnecting', False)
+        self.set_visible(bool(calls))
+        signature = json.dumps([control, audio, owner.enabled('call_control')], sort_keys=True)
+        if signature == self.signature:
+            return
+        self.signature = signature
+        owner.clear(self.cards); self.timers.clear()
+        for call in calls:
+            phase, cid = call.get('state'), call['id']
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            card.add_css_class('unity-card')
+            row = Adw.ActionRow(title=call.get('name') or call.get('number') or 'Unknown caller')
+            row.set_title_lines(2)
+            row.set_subtitle(' · '.join(filter(None, [call.get('number') if call.get('name') else '', {'ringing': 'Incoming call', 'dialing': 'Calling…', 'active': 'In call', 'held': 'On hold'}.get(phase, (phase or '').replace('_', ' ').title())])))
+            row.set_subtitle_lines(2)
+            timer = label('', 'title-3', valign=Gtk.Align.CENTER)
+            row.add_suffix(timer); self.timers.append((timer, call))
+            card.append(row)
+            buttons = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=6, row_spacing=6, max_children_per_line=4)
+            actions = [('Answer', 'answer'), ('Decline', 'reject')] if phase == 'ringing' else [('End call', 'hangup')]
+            if call.get('can_hold') and phase in ('active', 'held'):
+                actions.append(('Resume' if phase == 'held' else 'Hold', 'unhold' if phase == 'held' else 'hold'))
+            for title, action in actions:
+                button = Gtk.Button(label=title, sensitive=ready and phase != 'disconnecting')
+                if action in ('hangup', 'reject'): button.add_css_class('destructive-action')
+                elif action == 'answer': button.add_css_class('suggested-action')
+                button.connect('clicked', lambda _, a=action, call_id=cid: owner.execute('call_control', a, {'call_id': call_id}))
+                buttons.insert(button, -1)
+            if phase == 'active':
+                keypad = Gtk.MenuButton(label='Keypad', sensitive=ready)
+                popover = Gtk.Popover(); grid = Gtk.Grid(column_spacing=6, row_spacing=6, column_homogeneous=True)
+                for index, tone in enumerate('123456789*0#'):
+                    key = Gtk.Button(label=tone)
+                    key.connect('clicked', lambda _, t=tone, call_id=cid: owner.execute('call_control', 'dtmf', {'call_id': call_id, 'tone': t}, quiet=True))
+                    grid.attach(key, index % 3, index // 3, 1, 1)
+                popover.set_child(grid); keypad.set_popover(popover); buttons.insert(keypad, -1)
+            card.append(inset(buttons, 8)); self.cards.append(card)
+        self.tick()
+        computer = audio.get('state') in ('active', 'waiting')
+        routes = control.get('routes', [])
+        current = 'Computer' if computer else {'phone': 'Phone', 'speaker': 'Speakerphone', 'wired': 'Wired', 'bluetooth': 'Bluetooth'}.get(control.get('route'), 'Phone')
+        if owner.call_uses_hfp and control.get('route') == 'bluetooth': current = 'Computer'
+        self.route_button.set_label(current)
+        choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        popover = Gtk.Popover(); popover.set_child(inset(choices, 6))
+        for route, title in [('phone', 'Phone earpiece'), ('speaker', 'Phone speakerphone'), ('wired', 'Phone wired headset'), ('bluetooth', 'Phone Bluetooth headset'), ('desktop', 'Computer via Bluetooth')]:
+            supported = route in routes if route != 'desktop' else 'bluetooth' in routes
+            if route == 'bluetooth' and owner.call_uses_hfp: supported = False
+            button = Gtk.Button(label=title, sensitive=supported)
+            button.add_css_class('flat')
+            button.connect('clicked', lambda _, r=route: (popover.popdown(), owner.choose_call_route(r)))
+            choices.append(button)
+        self.route_button.set_popover(popover)
+        self.route_button.set_sensitive(ready and any(c.get('state') in ('active', 'held') for c in calls))
+        hint = audio.get('error') or control.get('error') or ''
+        if owner.call_uses_hfp and not hint:
+            hint = 'For phone speakerphone, enable phone speakerphone controls in Android Unity → Features.'
+        self.route_row.set_subtitle(hint)
+        self.mute_button.set_label('Unmute' if control.get('muted') else 'Mute')
+        self.mute_button.set_sensitive(ready and any(c.get('state') == 'active' for c in calls) and (not owner.call_uses_hfp or computer))
+        for row in (self.output, self.microphone):
+            if row:
+                row.set_visible(computer)
+                row.set_sensitive(ready and owner.enabled('call_control') and not owner.call_audio_selection_pending)
+
+    def tick(self):
+        for widget, call in self.timers:
+            widget.set_label(self.owner.call_elapsed(call))
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app, client_factory=Client):
         super().__init__(application=app, title='Unity', default_width=1140, default_height=780)
@@ -170,12 +298,46 @@ class Window(Adw.ApplicationWindow):
         self.bus_name = None
         self.pairing_active = self.updating_dropdown = False
         self.operations = {}
+        self.pending_files = []
+        self.file_sending = False
+        self.file_send_token = 0
+        self.file_send_error = ''
+        self.file_send_notice = ''
         self.generation = 0
+        self.properties_revision = self.state_request_revision = 0
         self.last_notifications = None
         self.notification_cards = {}
         self.pending_seek = None
         self.messages_loaded = self.photos_loaded = False
         self.sms_revision = None
+        self.last_sms_id = None
+        self.message_pages = {}
+        self.call_audio_active = False
+        self.call_audio_selection = {'output': '', 'microphone': ''}
+        self.call_audio_catalog = {}
+        self.call_audio_options = {'output': [''], 'microphone': ['']}
+        self.call_audio_updating = self.call_audio_devices_pending = self.call_audio_selection_pending = False
+        self.call_audio_muted = False
+        self.call_phone_address = None
+        self.call_uses_hfp = False
+        self.contacts_query = ""
+        self.contacts_next = self.history_next = None
+        self.history_loaded = False
+        self.call_signature = None
+        self.call_control_state = {}
+        self.call_clock = {}
+        self.call_timer_source = None
+        self.call_popup = self.call_popup_panel = self.call_popup_toasts = None
+        self.call_popup_status = None
+        self.call_popup_empty_source = None
+        self.call_popup_dismissed = set()
+        self.call_popup_ids = set()
+        self.popup_only = False
+        self.popup_device = None
+        self.open_page = None
+        self.popup_has_calls = False
+        self.call_audio_waiting = None
+        self.call_audio_wait_timeout = None
         self.message_data = []
         self.selected_address = None
         self.photo_items, self.photo_widgets, self.preview_queue = {}, {}, []
@@ -227,6 +389,7 @@ class Window(Adw.ApplicationWindow):
         self.add_breakpoint(bp)
         self.render({})
         self.client = client_factory(self.changed, self.error)
+        self.connect('close-request', self.close_main_call_window)
 
     def register_page(self, name, title, icon, widget):
         self.stack.add_named(widget, name)
@@ -321,6 +484,12 @@ class Window(Adw.ApplicationWindow):
         self.battery_value, self.battery_detail, battery_card = self.metric(metrics, 'battery-symbolic', 'Battery')
         self.battery_progress = Gtk.ProgressBar(show_text=False)
         battery_card.append(self.battery_progress)
+        self.battery_power = label('', 'heading', wrap=True)
+        self.battery_power.set_tooltip_text('Net power at the phone battery. Charging power excludes energy used directly by the phone.')
+        battery_card.append(self.battery_power)
+        self.battery_time = label('', 'dim-label', wrap=True)
+        self.battery_time.add_css_class('caption')
+        battery_card.append(self.battery_time)
         self.network_value, self.network_detail, _ = self.metric(metrics, 'network-cellular-symbolic', 'Network')
         overview.append(metrics)
         quick = self.group(overview, 'Quick actions')
@@ -351,20 +520,26 @@ class Window(Adw.ApplicationWindow):
         notifications.append(self.notifications_empty)
 
         self.build_messages()
-        calls = self.page('calls', 'Calls', 'call-start-symbolic')
-        self.heading(calls, 'Phone calls', 'Call information shared by your phone.')
-        cg = self.group(calls, 'Current call')
-        self.call_row = Adw.ActionRow(title='No active call', subtitle='')
-        self.call_row.add_prefix(Gtk.Image(icon_name='call-start-symbolic'))
-        cg.add(self.call_row)
+        self.build_calls()
 
         files = self.page('files', 'Files', 'folder-symbolic')
-        self.heading(files, 'Move files between devices', 'Send a file or browse a folder shared by your phone.')
-        fg = self.group(files, 'File transfers')
-        self.file_button = self.button(fg, 'Send to phone', 'Choose file…', self.choose_file)
+        self.heading(files, 'Move files between devices', 'Drop files anywhere in Unity to select them, or choose files below.')
+        fg = self.group(files, 'Send to device', 'All file types are supported, up to 64 MiB per file.')
+        self.file_button = self.button(fg, 'Select files', 'Choose files…', self.choose_file)
+        self.pending_file_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.pending_file_list.add_css_class('boxed-list')
+        fg.add(self.pending_file_list)
+        self.file_send_row = Adw.ActionRow(title='No files selected')
+        self.file_send_row.set_subtitle_lines(3)
+        self.file_send_button = Gtk.Button(label='Send to device', valign=Gtk.Align.CENTER)
+        self.file_send_button.add_css_class('suggested-action')
+        self.file_send_button.connect('clicked', self.send_selected_files)
+        self.file_send_row.add_suffix(self.file_send_button)
+        fg.add(self.file_send_row)
+        fg = self.group(files, 'Transfer activity')
         self.file_status = Adw.ActionRow(title='No transfer active')
         self.file_status.set_subtitle_lines(2)
-        self.file_open = icon_button('folder-open-symbolic', 'Show received file', self.open_received_file, 'flat')
+        self.file_open = icon_button('document-open-symbolic', 'Open received file', self.open_received_file, 'flat')
         self.file_status.add_suffix(self.file_open)
         self.received_path = None
         fg.add(self.file_status)
@@ -387,6 +562,18 @@ class Window(Adw.ApplicationWindow):
         photos.append(self.photos_empty)
 
         media = self.page('media', 'Media', 'multimedia-player-symbolic')
+        audio_group = Adw.PreferencesGroup(title='Audio routing')
+        self.audio_route = Adw.SwitchRow(title='Play laptop audio on this phone',
+            subtitle='Enable Laptop audio on phone in the Android Features page, then connect.')
+        self.audio_route.set_subtitle_lines(3)
+        self.audio_route.set_title_lines(2)
+        self.audio_route.set_sensitive(False)
+        self.audio_route.connect('notify::active', self.toggle_audio_route)
+        self.audio_updating = False
+        self.audio_pending = False
+        self.audio_state = {}
+        audio_group.add(self.audio_route)
+        media.append(audio_group)
         self.media_heading = self.heading(media, 'Now playing', 'Control the active media session on your phone.')
         self.media_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         self.media_card.add_css_class('unity-card')
@@ -439,9 +626,44 @@ class Window(Adw.ApplicationWindow):
         self.media_state = {}
         self.art_key = None
 
+        ring = self.group(media, 'Phone sound')
+        self.ringer_combo = Adw.ComboRow(title='Ringer mode', model=Gtk.StringList.new(['Normal', 'Vibrate', 'Silent', 'DND', 'DND off']))
+        ring.add(self.ringer_combo)
+        self.ringer_button = self.button(ring, 'Apply mode', 'Apply', lambda *_: self.execute('ringer', 'set',
+            {'mode': ['normal', 'vibrate', 'silent', 'dnd', 'off'][self.ringer_combo.get_selected()]}))
+        self.hotspot_button = self.button(ring, 'Phone internet sharing', 'Request', lambda *_: self.execute('hotspot', 'request_settings'), 'Review internet sharing settings on your phone.')
+
         remote = self.page('remote', 'Remote Control', 'input-keyboard-symbolic')
-        self.heading(remote, 'A little closer to your phone', 'Keyboard, touch input, and phone sound controls.')
-        rg = self.group(remote, 'Phone input', 'Enable Unity’s keyboard or accessibility service on your phone first.')
+        self.heading(remote, 'A little closer to your phone', 'Lock devices, share screens, and type on your phone.')
+        lock = self.group(remote, 'Device locking')
+        self.lock_phone_button = self.button(lock, 'Lock this phone', 'Lock phone',
+            lambda *_: self.execute('lock', 'lock'), 'Enable Remote device locking and activate phone locking in Android’s Features page.')
+        screens = self.group(remote, 'Screen sharing', 'Approve capture on the device sharing its screen each time.')
+        self.share_desktop_button = self.button(screens, 'Computer screen → phone', 'Share', lambda *_: self.start_screen('desktop'))
+        self.screen_control_switch = Adw.SwitchRow(title='Control computer from phone', subtitle='Allow keyboard and mouse access in the desktop sharing chooser.')
+        self.screen_control_switch.set_active(True)
+        screens.add(self.screen_control_switch)
+        self.screen_blank_switch = Adw.SwitchRow(title='Turn off laptop display while sharing', subtitle='The panel turns off after the phone viewer opens. It restores when sharing stops or the connection is lost.')
+        self.screen_blank_switch.set_subtitle_lines(3)
+        screens.add(self.screen_blank_switch)
+        def control_changed(row, _):
+            self.screen_blank_switch.set_sensitive(row.get_active())
+            if not row.get_active(): self.screen_blank_switch.set_active(False)
+        self.screen_control_switch.connect('notify::active', control_changed)
+        self.view_phone_button = self.button(screens, 'Phone screen → computer', 'View', lambda *_: self.start_screen('phone'))
+        self.stop_screen_button = self.button(screens, 'End screen sharing', 'Stop', lambda *_: self.execute('screen', 'stop'))
+        self.laptop_display_button = self.button(screens, 'Laptop display', 'Turn off', self.toggle_laptop_display,
+            'Restore the display at any time. Ending sharing or losing the connection also restores it.')
+        self.screen_status = Adw.ActionRow(title='No screen share', subtitle='Enable Screen sharing in the Android Features page, then connect.')
+        self.screen_status.set_subtitle_lines(3)
+        screens.add(self.screen_status)
+        self.screen_state = {}
+        self.screen_viewer = None
+        self.screen_picture = None
+        self.screen_fetching = False
+        self.screen_sequence = 0
+        self.screen_epoch = 0
+        rg = self.group(remote, 'Phone input' , 'Enable Unity’s keyboard or accessibility service on your phone first.')
         self.remote_text, self.remote_button = self.entry_action(rg, 'Text to type', 'input-keyboard-symbolic',
             lambda *_: self.execute('remote_input', 'text', {'text': self.remote_text.get_text()}))
         self.pad = Gtk.DrawingArea(content_height=200)
@@ -453,12 +675,6 @@ class Window(Adw.ApplicationWindow):
         drag.connect('drag-begin', self.drag_begin)
         drag.connect('drag-end', self.drag_end)
         self.pad.add_controller(drag)
-        ring = self.group(remote, 'Phone sound')
-        self.ringer_combo = Adw.ComboRow(title='Ringer mode', model=Gtk.StringList.new(['Normal', 'Vibrate', 'Silent', 'DND', 'DND off']))
-        ring.add(self.ringer_combo)
-        self.ringer_button = self.button(ring, 'Apply mode', 'Apply', lambda *_: self.execute('ringer', 'set',
-            {'mode': ['normal', 'vibrate', 'silent', 'dnd', 'off'][self.ringer_combo.get_selected()]}))
-        self.hotspot_button = self.button(ring, 'Phone internet sharing', 'Request', lambda *_: self.execute('hotspot', 'request_settings'), 'Review internet sharing settings on your phone.')
         settings = self.page('settings', 'Settings', 'preferences-system-symbolic', preferences=True)
         security = self.group(settings, 'Privacy and access')
         self.access_row = Adw.ActionRow(title='Access to your phone', subtitle='Checking access…')
@@ -473,7 +689,7 @@ class Window(Adw.ApplicationWindow):
             [Adw.ColorScheme.DEFAULT, Adw.ColorScheme.FORCE_LIGHT, Adw.ColorScheme.FORCE_DARK][row.get_selected()]))
         security.add(appearance)
         pairing = self.group(settings, 'Pair devices')
-        self.discovery_button = self.button(pairing, 'Discover on this network', 'Discover', self.discover)
+        self.discovery_button = self.button(pairing, 'Open pairing for Wi-Fi or Bluetooth', 'Discover', self.discover)
         self.pair_info = label('Pairing is closed', 'dim-label', wrap=True, selectable=True)
         pairing.add(self.pair_info)
         self.pair_requests = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
@@ -511,6 +727,9 @@ class Window(Adw.ApplicationWindow):
         self.message_hint = inset(label('Open Messages to load conversations.', 'dim-label', wrap=True), 12)
         self.message_hint.add_css_class('caption')
         threads.append(self.message_hint)
+        self.message_more = Gtk.Button(label='More conversations', visible=False, margin_start=12, margin_end=12)
+        self.message_more.connect('clicked',lambda *_: self.load_messages(offset=self.message_pages.get(None),append=True))
+        threads.append(self.message_more)
         self.message_split.set_sidebar(Adw.NavigationPage.new(threads, 'Messages'))
         chat = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.chat_title = Adw.WindowTitle(title='Choose a conversation')
@@ -523,6 +742,9 @@ class Window(Adw.ApplicationWindow):
                                        margin_start=18, margin_end=18, margin_top=18, margin_bottom=18)
         self.message_scroll.set_child(self.message_bubbles)
         chat.append(self.message_scroll)
+        self.conversation_more = Gtk.Button(label='Load older messages', visible=False)
+        self.conversation_more.connect('clicked',lambda *_: self.load_messages(address=self.selected_address,offset=self.message_pages.get(self.selected_address),append=True))
+        chat.append(self.conversation_more)
         self.composer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.composer.add_css_class('composer')
         self.sms_address = Gtk.Entry(placeholder_text='Phone number', tooltip_text='Recipient phone number')
@@ -541,6 +763,430 @@ class Window(Adw.ApplicationWindow):
         self.composer.append(self.send_hint)
         chat.append(self.composer)
         self.message_split.set_content(Adw.NavigationPage.new(chat, 'Conversation'))
+
+    def build_calls(self):
+        calls = self.page('calls', 'Calls', 'call-start-symbolic')
+        self.heading(calls, 'Phone calls', 'Enable Call management on your phone. Phone speakerphone controls also need the optional Phone app setup in Android Unity → Features.')
+        cg = self.group(calls, 'Current calls')
+        self.call_row = Adw.ActionRow(title='No active call')
+        self.call_phone_button = Gtk.Button(label='Choose call phone', valign=Gtk.Align.CENTER)
+        self.call_phone_button.connect('clicked', self.choose_call_phone)
+        self.call_row.add_suffix(self.call_phone_button)
+        cg.add(self.call_row)
+        self.active_calls = CallPanel(self)
+        calls.append(self.active_calls)
+        self.call_popup_button = Gtk.Button(label='Show call controls', visible=False)
+        self.call_popup_button.connect('clicked', lambda *_: self.show_call_popup(force=True))
+        calls.append(self.call_popup_button)
+        cg = self.group(calls, 'Computer call audio')
+        self.call_audio_row = Adw.ActionRow(title='Audio on phone', subtitle='PC audio requires Bluetooth hands-free support and a connected phone.')
+        cg.add(self.call_audio_row)
+        self.call_audio_button = Gtk.Button(label='Use computer', valign=Gtk.Align.CENTER)
+        self.call_audio_button.connect('clicked', self.desktop_call_audio)
+        self.call_audio_row.add_suffix(self.call_audio_button)
+        self.call_audio_refresh = icon_button('view-refresh-symbolic', 'Refresh call audio devices', self.refresh_call_audio_devices, 'flat')
+        self.call_audio_row.add_suffix(self.call_audio_refresh)
+        self.call_audio_mute = Gtk.Button(label='Mute microphone', valign=Gtk.Align.CENTER, visible=False)
+        self.call_audio_mute.connect('clicked', lambda *_: self.execute('call_control', 'audio_mute', {'muted': not self.call_audio_muted}))
+        self.call_audio_mute_row = Adw.ActionRow(title='Computer microphone', visible=False)
+        self.call_audio_mute_row.add_suffix(self.call_audio_mute)
+        self.call_output = Adw.ComboRow(title='Call output', model=Gtk.StringList.new(['System default']))
+        self.call_microphone = Adw.ComboRow(title='Call microphone', model=Gtk.StringList.new(['System default']))
+        self.call_output.set_subtitle('Follows sound settings. Select headphones for listening.')
+        self.call_microphone.set_subtitle('A Bluetooth microphone uses hands-free mode and may reduce playback quality.')
+        for field, row in [('output', self.call_output), ('microphone', self.call_microphone)]:
+            row.set_subtitle_lines(2)
+            row.connect('notify::selected', self.select_call_audio_device, field)
+            cg.add(row)
+        cg.add(self.call_audio_mute_row)
+        dial = self.group(calls, 'Dial a number')
+        self.call_number = Gtk.Entry(placeholder_text='Phone number, including country code', input_purpose=Gtk.InputPurpose.PHONE)
+        dial.add(self.call_number)
+        keypad = Gtk.Grid(column_spacing=6, row_spacing=6, column_homogeneous=True)
+        for index, tone in enumerate('123456789*0#'):
+            button = Gtk.Button(label=tone)
+            button.connect('clicked', lambda _, t=tone: self.call_number.set_text(self.call_number.get_text() + t))
+            keypad.attach(button, index % 3, index // 3, 1, 1)
+        dial.add(keypad)
+        self.dial_button = self.button(dial, 'Start call', 'Call', self.dial_call)
+        self.call_number.connect('activate', self.dial_call)
+        contacts = self.group(calls, 'Contacts')
+        self.contact_query = Gtk.SearchEntry(placeholder_text='Search name or phone number')
+        self.contact_query.connect('activate', lambda *_: self.load_contacts())
+        contacts.add(self.contact_query)
+        self.contact_search_button = self.button(contacts, 'Search your phone', 'Search', lambda *_: self.load_contacts())
+        self.call_contacts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        contacts.add(self.call_contacts)
+        self.contact_more = Gtk.Button(label='More contacts', visible=False)
+        self.contact_more.connect('clicked', lambda *_: self.load_contacts(True))
+        contacts.add(self.contact_more)
+        recent = self.group(calls, 'Recent calls', 'Calls from the past 90 days. History is managed on your phone.')
+        self.history_refresh = self.button(recent, 'Call history', 'Refresh', lambda *_: self.load_call_history())
+        self.call_history = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        recent.add(self.call_history)
+        self.history_more = Gtk.Button(label='More calls', visible=False)
+        self.history_more.connect('clicked', lambda *_: self.load_call_history(True))
+        recent.add(self.history_more)
+
+    def dial_call(self, *_):
+        number = self.call_number.get_text().strip()
+        if not number:
+            self.error('Enter a phone number.'); return
+        self.execute('call_control', 'dial', {'number': number}, done=lambda result: self.toasts.add_toast(Adw.Toast(title='Call requested on phone.')) if result else None)
+
+    def call_entry(self, box, name, number, subtitle=''):
+        row = Adw.ActionRow(title=name or number or 'Unknown caller', subtitle=' · '.join(filter(None, [number if name else '', subtitle])))
+        row.set_subtitle_lines(2)
+        button = Gtk.Button(label='Select', valign=Gtk.Align.CENTER)
+        button.connect('clicked', lambda *_: self.call_number.set_text(number))
+        row.add_suffix(button); box.append(row)
+
+    def load_contacts(self, more=False):
+        query = self.contact_query.get_text().strip()
+        if more and self.contacts_query != query: more = False
+        offset = self.contacts_next if more else 0
+        self.contacts_query = query
+        def loaded(result):
+            if result is None or query != self.contact_query.get_text().strip(): return
+            if not more: self.clear(self.call_contacts)
+            for contact in result.get('contacts', []): self.call_entry(self.call_contacts, contact.get('name'), contact.get('number', ''))
+            self.contacts_next = result.get('next_offset')
+            self.contact_more.set_visible(self.contacts_next is not None)
+        self.execute('call_control', 'contacts', {'query': query, 'offset': offset or 0}, done=loaded)
+
+    def load_call_history(self, more=False):
+        self.history_loaded = True
+        offset = self.history_next if more else 0
+        def loaded(result):
+            if result is None: return
+            if not more: self.clear(self.call_history)
+            for call in result.get('calls', []):
+                direction = {1:'Incoming', 2:'Outgoing', 3:'Missed', 4:'Voicemail', 5:'Rejected', 6:'Blocked', 7:'Answered elsewhere'}.get(call.get('type'), 'Call')
+                self.call_entry(self.call_history, call.get('name'), call.get('number', ''), f"{direction} · {timestamp(call.get('timestamp'), True)}")
+            self.history_next = result.get('next_offset')
+            self.history_more.set_visible(self.history_next is not None)
+        self.execute('call_control', 'history', {'offset': offset or 0}, done=loaded)
+
+    def render_calls(self, state, connected=True):
+        control = state.get('call_control', {})
+        previous = self.call_control_state
+        if previous.get('reconnecting') and not control.get('reconnecting') and previous.get('address') == control.get('address'):
+            # The service owns fresh IDs after restart. Carry only display
+            # elapsed time across an unambiguous match, never the old action ID.
+            old_calls, new_calls = previous.get('calls', []), control.get('calls', [])
+            for call in new_calls:
+                candidates = [old for old in old_calls if old.get('number') == call.get('number')]
+                peers = [new for new in new_calls if new.get('number') == call.get('number')]
+                if len(candidates) == len(peers) == 1:
+                    clock = self.call_clock.get((self.path, candidates[0]['id']))
+                    if clock:
+                        self.call_clock[(self.path, call['id'])] = (call.get('connect_time') or 0, clock[1], clock[2])
+        self.call_uses_hfp = control.get('backend') == 'bluetooth_hfp'
+        self.call_phone_address = control.get('address')
+        self.call_phone_button.set_sensitive(self.enabled('call_control'))
+        self.call_phone_button.set_visible(self.call_uses_hfp)
+        calls = control.get('calls', [])
+        old = state.get('call_notifications', {})
+        self.call_row.set_title(f'{len(calls)} current call(s)' if calls else {'ringing':'Incoming call', 'offhook':'Call in progress'}.get(old.get('state'), 'No active call'))
+        self.call_row.set_subtitle(control.get('error') or ('' if calls else (old.get('number') or self.capabilities.get('call_control', {}).get('reason', ''))))
+        self.call_row.set_subtitle_lines(3)
+        self.call_control_state = control
+        if self.call_audio_waiting:
+            device, generation, address = self.call_audio_waiting
+            if self.call_uses_hfp or device != self.path or generation != self.generation or not self.enabled('call_control') or not any(c.get('state') == 'active' for c in calls):
+                self.cancel_call_audio_wait()
+            elif control.get('route') == 'bluetooth':
+                self.cancel_call_audio_wait()
+                self.start_call_audio(address)
+        self.update_call_popup(control, state.get('call_audio', {}), connected)
+        audio = state.get('call_audio', {})
+        active = audio.get('state') in ('active', 'waiting')
+        self.call_audio_active = active
+        self.call_audio_muted = audio.get('muted', False)
+        if active and not self.call_audio_selection_pending:
+            self.call_audio_selection = {field: audio.get(field, '') for field in ('output', 'microphone')}
+            self.populate_call_audio_devices(self.call_audio_catalog)
+        self.call_audio_button.set_label('Stop computer audio' if active else 'Use computer')
+        self.call_audio_button.set_sensitive(self.enabled('call_control') and not control.get('reconnecting') and any(c.get('state') == 'active' for c in calls))
+        self.call_audio_row.set_title(('Waiting for call audio' if audio.get('state') == 'waiting' else 'Audio on computer') if active else f"Audio: {control.get('route', 'phone')}")
+        self.call_audio_row.set_subtitle(audio.get('error') or ('Device changes apply during the call.' if active else 'Choose output and microphone, then use computer audio.'))
+        self.call_audio_row.set_subtitle_lines(3)
+        self.call_audio_mute.set_visible(active)
+        self.call_audio_mute_row.set_visible(active)
+        self.call_audio_mute.set_label('Unmute microphone' if self.call_audio_muted else 'Mute microphone')
+        self.call_audio_mute.set_sensitive(self.enabled('call_control') and not control.get('reconnecting'))
+        self.call_audio_refresh.set_sensitive(self.enabled('call_control') and not self.call_audio_devices_pending)
+        for row in (self.call_output, self.call_microphone): row.set_sensitive(self.enabled('call_control') and not control.get('reconnecting') and not self.call_audio_selection_pending)
+        for button in (self.dial_button, self.contact_search_button, self.history_refresh, self.contact_more, self.history_more): button.set_sensitive(self.enabled('call_control'))
+        if not self.enabled('call_control'):
+            self.history_loaded = False
+            self.clear(self.call_contacts); self.clear(self.call_history)
+            self.contact_more.set_visible(False); self.history_more.set_visible(False)
+
+    def desktop_call_audio(self, *_):
+        if self.call_audio_active:
+            self.execute('call_control','audio_stop',done=lambda result:self.execute('call_control','route',{'route':'phone'}) if result else None); return
+        if self.call_uses_hfp and self.call_phone_address:
+            address = self.call_phone_address
+            self.execute('call_control','route',{'route':'desktop'},done=lambda result: self.start_call_audio(address) if result is not None else None)
+            return
+        def devices(result):
+            if result is None: return
+            phones = result.get('devices', [])
+            self.populate_call_audio_devices(result)
+            if not phones:
+                self.error('No phone hands-free audio gateway is connected. Pair the phone for calls in Bluetooth settings.'); return
+            if len(phones) == 1:
+                address = phones[0]['address']
+                self.execute('call_control', 'route', {'route': 'desktop'}, done=lambda result:
+                    self.start_call_audio(address) if result is not None else None)
+                return
+            dialog = Adw.MessageDialog(transient_for=self.call_popup or self, heading='Choose the paired phone', body='Choose the phone used by this Unity connection. Enable calls for this computer in the phone’s Bluetooth settings.')
+            choices = Gtk.DropDown(model=Gtk.StringList.new([f"{p['name']} · {p['address']}" for p in phones]))
+            dialog.set_extra_child(choices); dialog.add_response('cancel','Cancel'); dialog.add_response('connect','Use computer'); dialog.set_response_appearance('connect',Adw.ResponseAppearance.SUGGESTED)
+            path, generation = self.path, self.generation
+            def response(_, answer):
+                if answer != 'connect' or self.path != path or self.generation != generation: return
+                address = phones[choices.get_selected()]['address']
+                def routed(result):
+                    if result is None: return
+                    # Android acknowledges the request before its route callback. Refresh
+                    # the snapshot, then let the user retry if Bluetooth has not settled.
+                    self.execute('call_control','refresh',done=lambda _: self.start_call_audio(address))
+                self.execute('call_control','route',{'route':'desktop'},done=routed)
+            dialog.connect('response',response); dialog.present()
+        self.execute('call_control','audio_devices',done=devices)
+
+    def choose_call_route(self, route):
+        if route == 'desktop':
+            if not self.call_audio_active:
+                self.desktop_call_audio()
+            return
+        self.cancel_call_audio_wait()
+        def routed(result):
+            if result is not None:
+                self.execute('call_control', 'route', {'route': route})
+        self.execute('call_control', 'audio_stop', done=routed)
+
+    def call_elapsed(self, call):
+        if call.get('state') not in ('active', 'held', 'disconnecting'):
+            return ''
+        key = (self.path, call['id'])
+        connected = call.get('connect_time') or 0
+        if key not in self.call_clock or (connected and self.call_clock[key][0] != connected):
+            elapsed = max(0, (time.time() * 1000 - connected) / 1000) if connected else 0
+            self.call_clock[key] = (connected, time.monotonic(), elapsed)
+        _, observed, elapsed = self.call_clock[key]
+        return call_duration(elapsed + time.monotonic() - observed)
+
+    def tick_calls(self):
+        self.active_calls.tick()
+        if self.call_popup_panel:
+            self.call_popup_panel.tick()
+        return True
+
+    def update_call_popup(self, control, audio, connected=True):
+        available = connected and self.enabled('call_control')
+        calls = control.get('calls', []) if available else []
+        ids = {(self.path, c['id']) for c in calls}
+        self.call_popup_button.set_visible(bool(calls))
+        self.active_calls.render(control, audio)
+        if calls:
+            if self.call_popup_empty_source is not None:
+                GLib.source_remove(self.call_popup_empty_source); self.call_popup_empty_source = None
+            self.call_clock = {key: value for key, value in self.call_clock.items() if key in ids}
+            self.call_popup_dismissed.intersection_update(ids)
+            self.call_popup_ids = ids
+            self.popup_has_calls = True
+            if self.call_timer_source is None:
+                self.call_timer_source = GLib.timeout_add_seconds(1, self.tick_calls)
+            self.show_call_popup()
+            if self.call_popup_panel:
+                self.call_popup_status.set_label(control.get('error') or 'Reconnecting Bluetooth call controls…')
+                self.call_popup_status.set_visible(bool(control.get('reconnecting')))
+                self.call_popup_panel.render(control, audio)
+                self.call_popup.set_default_size(460, min(760, 380 + 140 * (len(calls) - 1) + (160 if audio.get('state') in ('active', 'waiting') else 0)))
+        else:
+            # HFP and asynchronous refreshes can briefly report no calls. Keep
+            # the same window through that gap, but clear all actionable data.
+            # Access loss/disconnection bypasses this confirmation immediately.
+            if available and self.popup_has_calls:
+                if self.call_popup_panel:
+                    self.call_popup_panel.render(control, audio)
+                    self.call_popup_status.set_label(control.get('error') or 'Updating call status…')
+                    self.call_popup_status.set_visible(True)
+                if self.call_popup_empty_source is None:
+                    self.call_popup_empty_source = GLib.timeout_add(2500, self.confirm_call_popup_end)
+            else:
+                self.close_call_popup()
+
+    def confirm_call_popup_end(self):
+        self.call_popup_empty_source = None
+        if not self.call_control_state.get('calls') or not self.enabled('call_control'):
+            self.close_call_popup()
+        return False
+
+    def close_call_popup(self):
+        if self.call_popup_empty_source is not None:
+            GLib.source_remove(self.call_popup_empty_source); self.call_popup_empty_source = None
+        if self.call_timer_source is not None:
+            GLib.source_remove(self.call_timer_source); self.call_timer_source = None
+        self.call_clock.clear(); self.call_popup_dismissed.clear(); self.call_popup_ids.clear()
+        if self.call_popup:
+            self.call_popup.destroy()
+        self.call_popup = self.call_popup_panel = self.call_popup_toasts = self.call_popup_status = None
+        if self.popup_has_calls and (self.popup_only or not self.get_visible()):
+            def close_if_finished():
+                if self.call_popup is None and (not self.call_control_state.get('calls') or not self.enabled('call_control')):
+                    self.destroy()
+                return False
+            GLib.idle_add(close_if_finished)
+        self.popup_has_calls = False
+
+    def show_call_popup(self, force=False):
+        ids = {(self.path, c['id']) for c in self.call_control_state.get('calls', [])}
+        if not ids or not self.enabled('call_control') or (not force and ids.issubset(self.call_popup_dismissed)):
+            return
+        if force:
+            self.call_popup_dismissed.clear()
+        if self.call_popup is None:
+            self.call_popup = Adw.Window(application=self.get_application(), title='Unity · Call controls', default_width=460, default_height=380)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.call_popup_toasts = Adw.ToastOverlay(); self.call_popup_toasts.set_child(content)
+            self.call_popup.set_content(self.call_popup_toasts)
+            header = Adw.HeaderBar(title_widget=Adw.WindowTitle(title='Call controls', subtitle=self.devices.get(self.path, {}).get('Name', 'Your phone')))
+            open_app = Gtk.Button(label='Open app')
+            open_app.connect('clicked', lambda *_: self.open_calls_page())
+            header.pack_start(open_app); content.append(header)
+            self.call_popup_status = inset(label('Updating call status…', wrap=True, visible=False), 16)
+            content.append(self.call_popup_status)
+            self.call_popup_panel = CallPanel(self, computer_selectors=True)
+            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            scroll.set_child(inset(self.call_popup_panel, 16)); content.append(scroll)
+            self.call_popup_panel.render(self.call_control_state, {})
+            self.populate_call_audio_devices(self.call_audio_catalog)
+            self.call_popup.connect('close-request', self.dismiss_call_popup)
+            self.call_popup.present()
+            GLib.idle_add(lambda: (self.refresh_call_audio_devices(), False)[1])
+        elif force:
+            self.call_popup.present()
+
+    def dismiss_call_popup(self, *_):
+        self.call_popup_dismissed.update(self.call_popup_ids)
+        self.call_popup = self.call_popup_panel = self.call_popup_toasts = self.call_popup_status = None
+        if self.popup_only or not self.get_visible():
+            if self.call_popup_empty_source is not None:
+                GLib.source_remove(self.call_popup_empty_source); self.call_popup_empty_source = None
+            if self.call_timer_source is not None:
+                GLib.source_remove(self.call_timer_source); self.call_timer_source = None
+            self.destroy()
+        return False
+
+    def close_main_call_window(self, *_):
+        if self.call_popup and self.call_popup.get_visible():
+            self.set_visible(False)
+            return True
+        if self.call_timer_source is not None:
+            GLib.source_remove(self.call_timer_source); self.call_timer_source = None
+        return False
+
+    def open_calls_page(self):
+        self.popup_only = False
+        self.nav.select_row(self.pages['calls'])
+        self.present()
+
+    def choose_call_phone(self, *_):
+        def loaded(result):
+            if result is None: return
+            phones = result.get('devices', [])
+            if not phones:
+                self.error(result.get('error') or 'Pair your phone for Bluetooth calls, install/start oFono and enable its WirePlumber HFP backend.'); return
+            dialog = Adw.MessageDialog(transient_for=self, heading='Choose your call phone', body='Choose the phone used by this Unity connection. Enable Calls for this computer in Android Bluetooth settings. Your usual Phone app stays in use.')
+            choices = Gtk.DropDown(model=Gtk.StringList.new([f"{p.get('name') or 'Phone'} · {p['address']}" for p in phones]))
+            dialog.set_extra_child(choices); dialog.add_response('cancel', 'Cancel'); dialog.add_response('connect', 'Connect calls')
+            dialog.set_response_appearance('connect', Adw.ResponseAppearance.SUGGESTED)
+            path, generation = self.path, self.generation
+            def response(_, answer):
+                if answer == 'connect' and self.path == path and self.generation == generation:
+                    self.execute('call_control', 'hfp_select', {'address': phones[choices.get_selected()]['address']})
+            dialog.connect('response', response); dialog.present()
+        self.execute('call_control', 'hfp_devices', done=loaded, quiet=True)
+
+    def start_call_audio(self, address):
+        if not self.call_uses_hfp and self.call_control_state.get('route') != 'bluetooth':
+            self.cancel_call_audio_wait()
+            self.call_audio_waiting = (self.path, self.generation, address)
+            def expired():
+                self.call_audio_wait_timeout = None
+                self.call_audio_waiting = None
+                self.error('The phone has not switched to computer Bluetooth audio. Check that Calls is enabled for this computer, then try again.')
+                return False
+            self.call_audio_wait_timeout = GLib.timeout_add_seconds(5, expired)
+            return
+        def started(result):
+            if result is None: self.execute('call_control','route',{'route':'phone'},quiet=True)
+        self.execute('call_control','audio_start',{'address':address, **self.call_audio_selection},done=started)
+
+    def cancel_call_audio_wait(self):
+        self.call_audio_waiting = None
+        if self.call_audio_wait_timeout is not None:
+            GLib.source_remove(self.call_audio_wait_timeout)
+            self.call_audio_wait_timeout = None
+
+    def populate_call_audio_devices(self, result):
+        self.call_audio_catalog = result
+        self.call_audio_updating = True
+        try:
+            rows = [('output', 'outputs', self.call_output), ('microphone', 'microphones', self.call_microphone)]
+            if self.call_popup_panel:
+                rows += [('output', 'outputs', self.call_popup_panel.output), ('microphone', 'microphones', self.call_popup_panel.microphone)]
+            for field, key, row in rows:
+                choices = [{'id': '', 'name': 'System default'}] + result.get(key, [])
+                selected = self.call_audio_selection[field]
+                if selected not in [c['id'] for c in choices]:
+                    choices.append({'id': selected, 'name': 'Unavailable · ' + selected})
+                self.call_audio_options[field] = [c['id'] for c in choices]
+                names = [c['name'] for c in choices]
+                model = row.get_model()
+                if model is None or model.get_n_items() != len(names) or any(model.get_string(i) != name for i, name in enumerate(names)):
+                    row.set_model(Gtk.StringList.new(names))
+                index = self.call_audio_options[field].index(selected)
+                if row.get_selected() != index:
+                    row.set_selected(index)
+        finally:
+            self.call_audio_updating = False
+
+    def refresh_call_audio_devices(self, *_):
+        if not self.enabled('call_control') or self.call_audio_devices_pending: return
+        self.call_audio_devices_pending = True
+        self.call_audio_refresh.set_sensitive(False)
+        def loaded(result):
+            self.call_audio_devices_pending = False
+            self.call_audio_refresh.set_sensitive(self.enabled('call_control'))
+            if result is not None: self.populate_call_audio_devices(result)
+        self.execute('call_control', 'audio_devices', done=loaded, quiet=True)
+
+    def select_call_audio_device(self, row, _, field):
+        if self.call_audio_updating: return
+        index = row.get_selected()
+        if index >= len(self.call_audio_options[field]): return
+        self.call_audio_selection[field] = self.call_audio_options[field][index]
+        # Replacing an Adw.ComboRow model during its selection notification can
+        # recurse inside GTK. Synchronize the other surface after this event.
+        GLib.idle_add(lambda: (self.populate_call_audio_devices(self.call_audio_catalog), False)[1])
+        if not self.call_audio_active: return
+        self.call_audio_selection_pending = True
+        choices = [self.call_output, self.call_microphone]
+        if self.call_popup_panel: choices += [self.call_popup_panel.output, self.call_popup_panel.microphone]
+        for choice in choices: choice.set_sensitive(False)
+        def selected(result):
+            self.call_audio_selection_pending = False
+            for choice in choices: choice.set_sensitive(self.enabled('call_control'))
+            if result is not None:
+                self.call_audio_selection = {key: result.get(key, '') for key in ('output', 'microphone')}
+                self.populate_call_audio_devices(self.call_audio_catalog)
+            else: self.changed(self.path)
+        self.execute('call_control', 'audio_select', dict(self.call_audio_selection), done=selected)
 
     def draw_pad(self, area, cr, width, height):
         cr.set_source_rgba(0.5, 0.5, 0.5, 0.10)
@@ -574,6 +1220,9 @@ class Window(Adw.ApplicationWindow):
         if page == 'photos' and self.enabled('photos'):
             self.load_photos()
             self.pump_previews()
+        elif page == 'calls' and self.enabled('call_control'):
+            if not self.history_loaded: self.load_call_history()
+            self.refresh_call_audio_devices()
         elif page == 'messages' and self.enabled('sms'):
             self.load_messages()
 
@@ -589,6 +1238,8 @@ class Window(Adw.ApplicationWindow):
         if any(s in message for s in ('NotAuthorized', 'daemon stopped', 'daemon is stopped', 'Disconnected')):
             self.authorized = False
             self.render({})
+        if self.call_popup_toasts and self.call_popup and self.call_popup.get_visible():
+            self.call_popup_toasts.add_toast(Adw.Toast(title=message))
         self.banner.set_title(message)
         self.banner.set_button_label('Retry')
         self.banner.set_revealed(True)
@@ -644,6 +1295,10 @@ class Window(Adw.ApplicationWindow):
         dialog.present(self)
 
     def changed(self, path):
+        if path.startswith('screen-frame:'):
+            if path.removeprefix('screen-frame:') == self.path:
+                self.fetch_screen_frame()
+            return
         if path == 'daemon-restarted':
             self.requested_access = self.authorized = False
             self.access_check_pending = False
@@ -654,7 +1309,8 @@ class Window(Adw.ApplicationWindow):
         if path == ROOT and self.pairing_active and self.authorized:
             self.client.manager('PairingInfo', done=self.pairing)
         if path in self.operations:
-            self.client.call(path, 'org.unityconnect.Operation1', 'GetState', done=lambda s: self.operation(path, json.loads(s)))
+            self.client.call(path, 'org.unityconnect.Operation1', 'GetState', done=lambda s: self.operation(path, json.loads(s)),
+                             failed=lambda message: self.operation_error(path, message))
         if '/operations/' in path:
             return
         if not self.pending_refresh:
@@ -700,7 +1356,17 @@ class Window(Adw.ApplicationWindow):
             GLib.idle_add(self.refresh)
 
     def listed(self, paths):
+        self.properties_revision += 1
+        revision = self.properties_revision
         self.devices = {p: self.devices.get(p, {}) for p in paths}
+        if self.popup_device:
+            target = '/org/unityconnect/devices/d_' + self.popup_device
+            if target in paths:
+                if self.path != target:
+                    self.generation += 1
+                    self.render({})
+                self.path = target
+                self.popup_device = None
         if not paths:
             self.path = None
             self.capabilities = {}
@@ -713,7 +1379,7 @@ class Window(Adw.ApplicationWindow):
             return
         for path in paths:
             self.client.call(path, 'org.freedesktop.DBus.Properties', 'GetAll', '(s)', ('org.unityconnect.Device1',),
-                lambda props, p=path: self.properties(p, props))
+                lambda props, p=path: self.properties(p, props) if revision == self.properties_revision else None)
 
     def properties(self, path, props):
         if path not in self.devices:
@@ -732,9 +1398,16 @@ class Window(Adw.ApplicationWindow):
                 self.render({})
             elif self.authorized:
                 generation = self.generation
+                self.state_request_revision += 1
+                revision = self.state_request_revision
                 self.client.call(path, 'org.unityconnect.Device1', 'GetState', done=lambda s:
-                    self.render(json.loads(s)) if self.path == path and generation == self.generation else None)
+                    self.render(json.loads(s)) if self.path == path and generation == self.generation
+                    and revision == self.state_request_revision
+                    and self.authorized and self.devices.get(path, {}).get('Connected') else None)
             self.render_capabilities()
+            if self.open_page and self.open_page[0] == path:
+                self.nav.select_row(self.pages[self.open_page[1]])
+                self.open_page = None
 
     def device_selected(self, dropdown, _):
         if self.updating_dropdown:
@@ -744,6 +1417,9 @@ class Window(Adw.ApplicationWindow):
         if index < len(paths) and paths[index] != self.path:
             self.path = paths[index]
             self.capabilities = {}
+            self.call_audio_selection = {'output': '', 'microphone': ''}
+            self.call_audio_selection_pending = self.call_audio_devices_pending = False
+            self.populate_call_audio_devices({})
             self.render({})
             self.refresh()
 
@@ -759,7 +1435,7 @@ class Window(Adw.ApplicationWindow):
                 self.cap_group.remove(row)
             self.cap_rows.clear()
             for feature, cap in self.capabilities.items():
-                row = Adw.SwitchRow(title=feature.replace('_', ' ').title(), subtitle=cap['reason'] or cap['status'].replace('_', ' '))
+                row = Adw.SwitchRow(title='Laptop audio on phone' if feature == 'audio' else feature.replace('_', ' ').title(), subtitle=cap['reason'] or cap['status'].replace('_', ' '))
                 row.set_subtitle_lines(3)
                 row.set_active(cap['status'] != 'disabled')
                 row.set_sensitive(self.authorized and cap['status'] in ('available', 'disabled', 'user_action_required'))
@@ -768,22 +1444,30 @@ class Window(Adw.ApplicationWindow):
                 self.cap_group.add(row)
                 self.cap_rows.append(row)
         controls = [(self.find_button, 'find'), (self.url_button, 'urls'), (self.clip_button, 'clipboard'),
-                    (self.sms_button, 'sms'), (self.new_message, 'sms'), (self.message_refresh, 'sms'), (self.file_button, 'files'),
+                    (self.sms_button, 'sms'), (self.new_message, 'sms'), (self.message_refresh, 'sms'),
                     (self.photos_button, 'photos'), (self.browse_button, 'browsing'), (self.remote_button, 'remote_input'),
+                    (self.lock_phone_button, 'lock'), (self.share_desktop_button, 'screen'), (self.view_phone_button, 'screen'),
                     (self.pad, 'remote_input'), (self.ringer_button, 'ringer'), (self.hotspot_button, 'hotspot')]
         for widget, feature in controls:
             widget.set_sensitive(self.enabled(feature))
         self.discovery_button.set_sensitive(self.authorized)
         self.unpair_button.set_sensitive(bool(self.authorized and self.path))
-        groups = {'notifications': ['notifications'], 'messages': ['sms'], 'calls': ['call_notifications'],
-                  'files': ['files', 'browsing'], 'photos': ['photos'], 'media': ['media'],
-                  'remote': ['remote_input', 'find', 'ringer', 'hotspot']}
+        groups = {'notifications': ['notifications'], 'messages': ['sms'], 'calls': ['call_notifications', 'call_control'],
+                  'files': ['files', 'browsing'], 'photos': ['photos'], 'media': ['media', 'audio', 'ringer', 'hotspot'],
+                  'remote': ['remote_input', 'find', 'lock', 'screen']}
         for page, features in groups.items():
             visible = any(self.capabilities.get(f, {}).get('status') in ('available', 'user_action_required') for f in features)
+            if page == 'media' and 'audio' in self.capabilities:
+                visible = True
+            if page == 'files':
+                visible = True
             self.pages[page].set_visible(visible)
             if not visible and self.stack.get_visible_child_name() == page:
                 self.nav.select_row(self.pages['overview'])
         self.update_media_controls()
+        self.render_audio_route(self.audio_state)
+        self.render_screen(self.screen_state)
+        self.render_file_selection()
 
     @staticmethod
     def clear(box):
@@ -795,29 +1479,36 @@ class Window(Adw.ApplicationWindow):
         connected = device.get('connected', False)
         self.device_heading.set_label(device.get('name') or 'Your phone, at a glance')
         self.connection_value.set_label('Connected' if connected else 'Disconnected')
-        self.connection_detail.set_label('Ready to share' if connected else 'Live information is unavailable')
-        battery = state.get('battery', {})
-        self.battery_value.set_label(f"{battery['level']}%" if battery else 'Unavailable')
-        self.battery_detail.set_label(('Charging' if battery.get('charging') else 'On battery') if battery else 'Connect your phone')
-        self.battery_progress.set_fraction(battery.get('level', 0) / 100)
+        transport = state.get('transport', {})
+        detail = {'both': 'Bluetooth + Wi-Fi / LAN · Encrypted', 'bluetooth': 'Bluetooth · Encrypted', 'lan': 'Wi-Fi / LAN · Encrypted'}.get(transport.get('kind'), 'Encrypted connection')
+        if transport.get('kind') == 'both':
+            detail += '\nControls over Bluetooth · Files and streams over Wi-Fi / LAN'
+        self.connection_detail.set_label(detail if connected else 'Live information is unavailable')
+        self.render_battery(state.get('battery', {}) if connected else {})
         network = state.get('network', {})
         self.network_value.set_label({'wifi': 'Wi-Fi', 'cellular': 'Mobile data', 'ethernet': 'Ethernet', 'none': 'Offline'}.get(network.get('kind'), 'Unavailable'))
         signal = network.get('signal')
         self.network_detail.set_label(' · '.join(filter(None, [network.get('operator'), f'Signal {signal}/4' if signal is not None else ''])))
-        call = state.get('call_notifications', {})
-        self.call_row.set_title({'ringing': 'Incoming call', 'offhook': 'Call in progress', 'idle': 'No active call'}.get(call.get('state'), 'No active call'))
-        self.call_row.set_subtitle(call.get('number') or ('Caller information unavailable' if call.get('state') == 'ringing' else ''))
+        self.render_calls(state if connected and self.authorized else {}, connected)
+        reports = state.get('sms', {}).get('reports', {})
+        if self.last_sms_id in reports:
+            self.send_hint.set_label({'submitted_to_modem':'Waiting for carrier reports.', 'sent':'Sent. Delivery report pending.', 'delivered':'Delivered.', 'failed':'Message failed to send.', 'delivery_failed':'Carrier reported delivery failure.'}.get(reports[self.last_sms_id].get('state'), 'Status unavailable.'))
         self.render_media(state.get('media', {}))
+        if not connected:
+            self.audio_pending = False
+        self.render_audio_route(state.get('audio', {}))
+        self.render_screen(state.get('screen', {}))
         self.clip_receive.set_label(state.get('clipboard', {}).get('text', ''))
         self.clip_receive.set_visible(bool(self.clip_receive.get_label()))
         self.incoming_url = state.get('urls', {}).get('url')
         self.url_receive.set_subtitle(self.incoming_url or 'No shared URL')
         self.url_open.set_sensitive(bool(self.incoming_url))
+        previous_received_path = self.received_path
         self.received_path = state.get('files', {}).get('received_path')
-        self.file_status.set_subtitle(self.received_path.rsplit('/', 1)[-1] if self.received_path else '')
         self.file_open.set_visible(bool(self.received_path))
-        if self.received_path:
+        if self.received_path and self.received_path != previous_received_path and not self.file_sending:
             self.file_status.set_title('File received')
+            self.file_status.set_subtitle(self.received_path.rsplit('/', 1)[-1])
         self.render_notifications(state.get('notifications', {}))
         revision = state.get('sms', {}).get('revision')
         if revision is not None and revision != self.sms_revision:
@@ -825,8 +1516,20 @@ class Window(Adw.ApplicationWindow):
             self.messages_loaded = False
         if not connected:
             self.generation += 1
+            self.call_audio_selection_pending = self.call_audio_devices_pending = False
+            if self.file_sending:
+                self.file_send_token += 1
+                self.file_sending = False
+                self.file_send_error = 'Transfer interrupted. Reconnect and send the remaining files again.'
+                self.file_status.set_title('Transfer interrupted')
             self.messages_loaded = self.photos_loaded = False
             self.sms_revision = None
+            self.last_sms_id = None
+            self.message_pages.clear()
+            self.message_more.set_visible(False); self.conversation_more.set_visible(False)
+            self.clear(self.call_contacts); self.clear(self.call_history)
+            self.contacts_next = self.history_next = None
+            self.history_loaded = False
             self.message_data = []
             self.selected_address = None
             self.clear(self.threads)
@@ -842,12 +1545,52 @@ class Window(Adw.ApplicationWindow):
             self.clear(self.browser)
             self.sms_address.set_text('')
             self.sms_body.get_buffer().set_text('')
+            self.call_number.set_text(''); self.contact_query.set_text('')
         else:
             self.banner.set_revealed(False)
             self.access_row.set_subtitle('Unity has access for this app session.')
         self.render_capabilities()
         if connected and hasattr(self, 'client'):
             self.load_visible()
+
+    def render_battery(self, battery):
+        self.battery_value.set_label(f"{battery['level']}%" if battery else 'Unavailable')
+        status = battery.get('status')
+        description = {'full': 'Fully charged', 'charging': 'Charging', 'discharging': 'On battery',
+                       'not_charging': 'Plugged in · Charging paused' if battery.get('plugged') else 'On battery',
+                       'unknown': 'Battery status unavailable'}.get(status)
+        self.battery_detail.set_label(description or (('Charging' if battery.get('charging') else 'On battery') if battery else 'Connect your phone'))
+        self.battery_progress.set_fraction(battery.get('level', 0) / 100)
+        self.battery_power.set_visible(bool(battery))
+        self.battery_time.set_visible(bool(battery))
+        if not battery:
+            self.battery_power.set_label('')
+            self.battery_time.set_label('')
+            return
+        if 'power_w' not in battery:
+            self.battery_power.set_label('Power draw unavailable')
+            self.battery_time.set_label('Update the Android companion for power and time estimates.')
+            self.battery_time.set_tooltip_text(None)
+            return
+        watts = battery.get('power_w')
+        valid_power = isinstance(watts, (int, float)) and not isinstance(watts, bool) and math.isfinite(watts)
+        self.battery_power.set_label(f'{"Charging" if watts < 0 else "Battery draw"} · {abs(watts):.2f} W' if valid_power else 'Power not reported by phone')
+        duration = battery_time_text(battery.get('remaining_seconds'))
+        if duration is not None and battery.get('estimate_state') == 'available':
+            if status == 'full':
+                text = 'Fully charged'
+            elif battery.get('estimate_kind') == 'full':
+                text = f'Estimated · {duration.lower()} to full'
+            else:
+                text = f'Estimated · {duration.lower()} left'
+        elif battery.get('estimate_state') == 'collecting':
+            text = 'Estimating time remaining…'
+        else:
+            text = 'Time estimate unavailable'
+        self.battery_time.set_label(text)
+        self.battery_time.set_tooltip_text({'android': 'Estimated by Android. Charging slows as the battery fills.',
+            'charge_counter': 'Based on remaining charge and recent battery current. Time changes with phone usage.',
+            'battery_trend': 'Based on the measured battery level trend. Time changes with phone usage.'}.get(battery.get('estimate_source')))
 
     def render_notifications(self, notifications):
         if notifications == self.last_notifications:
@@ -903,6 +1646,11 @@ class Window(Adw.ApplicationWindow):
             previous = card
 
     def execute(self, feature, action, data=None, done=None, quiet=False):
+        if feature == 'call_control' and self.call_control_state.get('reconnecting') and action not in (
+                'refresh', 'dial', 'contacts', 'history', 'audio_devices', 'audio_stop', 'hfp_devices', 'hfp_select'):
+            if not quiet: self.error('Bluetooth call controls are reconnecting. Try again when connected.')
+            if done: done(None)
+            return
         if not self.path or not self.enabled(feature):
             if done:
                 done(None)
@@ -926,7 +1674,17 @@ class Window(Adw.ApplicationWindow):
         self.operations[path] = meta
         if not meta['quiet']:
             self.activity_row.set_title(f"{meta['feature'].replace('_', ' ').title()} in progress")
-        self.client.call(path, 'org.unityconnect.Operation1', 'GetState', done=lambda s: self.operation(path, json.loads(s)))
+        self.client.call(path, 'org.unityconnect.Operation1', 'GetState', done=lambda s: self.operation(path, json.loads(s)),
+                         failed=lambda message: self.operation_error(path, message))
+
+    def operation_error(self, path, message):
+        meta = self.operations.pop(path, None)
+        if not meta or meta['device'] != self.path or meta['generation'] != self.generation:
+            return
+        if meta['done']:
+            meta['done'](None)
+        if not meta['quiet']:
+            self.error(message)
 
     def operation(self, path, op):
         meta = self.operations.get(path)
@@ -942,6 +1700,9 @@ class Window(Adw.ApplicationWindow):
             if op['feature'] == 'files':
                 self.file_status.set_title(f"Sending · {op['progress']}%")
             return
+        if op['feature'] == 'files':
+            self.file_status.set_title('File sent' if op['status'] == 'completed' else 'Transfer failed')
+            self.file_status.set_subtitle(op.get('error') or (op.get('result') or {}).get('name', ''))
         self.operations.pop(path, None)
         result = op.get('result') or {}
         if meta['done']:
@@ -952,29 +1713,36 @@ class Window(Adw.ApplicationWindow):
         elif not meta['quiet']:
             self.toasts.add_toast(Adw.Toast(title='Operation completed'))
 
-    def load_messages(self, force=False, address=None):
-        if not self.enabled('sms') or (self.messages_loaded and not force and address is None):
+    def load_messages(self, force=False, address=None, offset=0, append=False):
+        if not self.enabled('sms') or (self.messages_loaded and not force and address is None and not append):
             return
         self.messages_loaded = True
         self.message_hint.set_label('Loading messages…')
-        self.execute('sms', 'list', {'address': address} if address is not None else {},
-            done=lambda result: self.show_messages(result, address), quiet=True)
+        payload = {'offset': offset or 0}
+        if address is not None: payload['address'] = address
+        self.execute('sms', 'list', payload,
+            done=lambda result: self.show_messages(result, address, append), quiet=True)
 
-    def show_messages(self, result, address=None):
+    def show_messages(self, result, address=None, append=False):
         if result is None:
             self.messages_loaded = False
             self.message_hint.set_label('Messages could not be loaded. Try Refresh.')
             return
         items = result.get('messages', [])
-        if address is None:
+        if append:
+            self.message_data = list({m.get('id'):m for m in self.message_data + items}.values())
+        elif address is None:
             self.message_data = items
         else:
             self.message_data = [m for m in self.message_data if m.get('address') != address] + items
+        self.message_pages[address] = result.get('next_offset')
+        self.message_more.set_visible(self.message_pages.get(None) is not None)
+        self.conversation_more.set_visible(self.selected_address is not None and self.message_pages.get(self.selected_address) is not None)
         self.render_threads()
         if self.selected_address:
             self.render_conversation()
         self.message_hint.set_label(f'{len(self.message_data)} recent messages' if self.message_data else 'No messages found on your phone.')
-        if address is None and self.selected_address:
+        if address is None and self.selected_address and not append:
             self.load_messages(address=self.selected_address)
 
     def render_threads(self):
@@ -1075,9 +1843,11 @@ class Window(Adw.ApplicationWindow):
                 self.send_hint.set_label('Message was not submitted. Your draft is kept.')
                 return
             buffer.set_text('')
-            self.send_hint.set_label('Submitted to phone. Carrier delivery is not confirmed.')
+            self.last_sms_id = result.get('message_id')
+            self.send_hint.set_label('Submitted to phone. Waiting for carrier reports.')
             self.selected_address = address
             self.load_messages(force=True, address=address)
+            self.refresh()
         self.execute('sms', 'send', {'address': address, 'body': body}, done=sent)
 
     def load_photos(self, force=False):
@@ -1241,6 +2011,127 @@ class Window(Adw.ApplicationWindow):
             button.set_sensitive(bool(self.enabled('media') and active and (allowed is None or action in allowed) and
                 (action != 'seek' or media.get('duration', 0) > 0)))
 
+    def start_screen(self, source):
+        if source == 'phone':
+            self.open_screen_viewer()
+        options = {'source': source}
+        if source == 'desktop': options.update(control=self.screen_control_switch.get_active(), blank_display=self.screen_blank_switch.get_active())
+        self.execute('screen', 'start', options)
+
+    def toggle_laptop_display(self, *_):
+        session = self.screen_state.get('session_id')
+        if session:
+            self.execute('screen', 'display', {'session_id': session, 'on': not self.screen_state.get('display_on', True)})
+
+    def open_screen_viewer(self):
+        if self.screen_viewer:
+            self.screen_viewer.present()
+            return
+        viewer_path = self.path
+        self.screen_viewer_path = viewer_path
+        viewer = Adw.Window(title='Phone screen', default_width=420, default_height=740,
+                            transient_for=self, application=self.get_application())
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(Adw.HeaderBar(title_widget=Adw.WindowTitle(title='Phone screen')))
+        self.screen_picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True, vexpand=True)
+        box.append(self.screen_picture)
+        stop = Gtk.Button(label='Stop screen sharing', margin_start=12, margin_end=12, margin_top=12, margin_bottom=12)
+        stop.connect('clicked', lambda *_: viewer.close())
+        box.append(stop)
+        viewer.set_content(box)
+        self.screen_viewer = viewer
+        self.screen_sequence = 0
+        def closed(*_):
+            self.screen_picture.set_paintable(None)
+            self.screen_viewer = self.screen_picture = None
+            if self.authorized and viewer_path:
+                self.client.call(viewer_path, 'org.unityconnect.Device1', 'Execute', '(sss)',
+                    ('screen', 'stop', '{}'), failed=lambda _: None)
+            return False
+        viewer.connect('close-request', closed)
+        viewer.present()
+        self.fetch_screen_frame()
+
+    def fetch_screen_frame(self):
+        if not self.screen_viewer or self.screen_fetching or self.screen_viewer_path != self.path or not self.enabled('screen'):
+            return
+        self.screen_fetching = True
+        path = self.path
+        epoch, viewer = self.screen_epoch, self.screen_viewer
+        def complete(value):
+            self.screen_fetching = False
+            if path != self.path or not self.screen_picture or self.screen_viewer_path != path or not self.enabled('screen') or epoch != self.screen_epoch or viewer is not self.screen_viewer:
+                return
+            sequence, width, height, jpeg = value
+            if sequence <= self.screen_sequence or not (1 <= max(width, height) <= 1280 and width * height <= 921600 and len(jpeg) <= 262144):
+                return
+            try:
+                texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(bytes(jpeg)))
+                if (texture.get_width(), texture.get_height()) != (width, height):
+                    return
+                self.screen_sequence = sequence
+                self.screen_picture.set_paintable(texture)
+            except GLib.Error as e:
+                self.error(e.message)
+        self.client.call(path, 'org.unityconnect.Screen1', 'GetFrame', done=complete,
+                         failed=lambda _: setattr(self, 'screen_fetching', False))
+
+    def render_screen(self, screen):
+        if self.screen_state != screen:
+            self.screen_epoch += 1
+        self.screen_state = screen
+        active = screen.get('state') in ('starting', 'streaming')
+        self.share_desktop_button.set_sensitive(self.enabled('screen') and not active)
+        self.view_phone_button.set_sensitive(self.enabled('screen') and not active)
+        self.stop_screen_button.set_sensitive(self.enabled('screen') and active)
+        desktop = active and screen.get('source') == 'desktop'
+        self.laptop_display_button.set_label('Turn off' if screen.get('display_on', True) else 'Turn on')
+        self.laptop_display_button.set_sensitive(self.enabled('screen') and desktop and screen.get('state') == 'streaming' and screen.get('display_available', False))
+        self.screen_control_switch.set_sensitive(not active)
+        self.screen_blank_switch.set_sensitive(not active and self.screen_control_switch.get_active())
+        self.screen_status.set_title(('Sharing computer screen' if screen.get('source') == 'desktop' else 'Viewing phone screen') if active else 'No screen share')
+        self.screen_status.set_subtitle(screen.get('error') or screen.get('display_error') or ('Laptop display is off; restore it here or on the phone.' if desktop and not screen.get('display_on', True) else 'Approve capture on the sharing device…' if screen.get('state') == 'starting' else
+            'Live · Close the viewer or press Stop to end sharing.' if active else 'Enable Screen sharing in the Android Features page, then connect.'))
+        if active and screen.get('source') == 'phone' and not self.screen_viewer:
+            self.open_screen_viewer()
+        if self.screen_picture and (not active or self.screen_viewer_path != self.path):
+            self.screen_picture.set_paintable(None)
+
+    def render_audio_route(self, audio):
+        self.audio_state = audio
+        active = audio.get('state') in ('starting', 'streaming')
+        self.audio_updating = True
+        if not self.audio_pending:
+            self.audio_route.set_active(active)
+        self.audio_updating = False
+        self.audio_route.set_sensitive(self.enabled('audio') and not self.audio_pending)
+        if audio.get('error'):
+            subtitle = audio['error']
+        elif active:
+            subtitle = ('Connecting audio…' if audio.get('state') == 'starting' else
+                        'Laptop sound plays on the phone. Turn off to restore laptop output.')
+        elif self.enabled('audio'):
+            subtitle = 'Send laptop sound to your phone over the encrypted connection.'
+        else:
+            cap = self.capabilities.get('audio', {})
+            subtitle = ('Update the Android companion to enable audio routing.' if cap.get('status') == 'unsupported' else
+                        'Enable Laptop audio on phone in the Android Features page, then connect.')
+        self.audio_route.set_subtitle(subtitle)
+
+    def toggle_audio_route(self, row, _):
+        if self.audio_updating or self.audio_pending:
+            return
+        if not self.enabled('audio'):
+            self.render_audio_route(self.audio_state)
+            return
+        self.audio_pending = True
+        row.set_sensitive(False)
+        def finished(result):
+            self.audio_pending = False
+            self.render_audio_route(self.audio_state)
+            self.refresh()
+        self.execute('audio', 'start' if row.get_active() else 'stop', done=finished)
+
     def toggle_media(self, *_):
         self.execute('media', 'pause' if self.media_state.get('playing') else 'play')
 
@@ -1262,19 +2153,136 @@ class Window(Adw.ApplicationWindow):
 
     def open_received_file(self, *_):
         if self.received_path:
-            parent = Gio.File.new_for_path(self.received_path).get_parent()
-            Gio.AppInfo.launch_default_for_uri_async(parent.get_uri(), None, None, None)
+            file = Gio.File.new_for_path(self.received_path)
+            Gio.AppInfo.launch_default_for_uri_async(file.get_uri(), None, None, None)
 
     def choose_file(self, *_):
-        dialog = Gtk.FileDialog(title='Send to phone')
+        dialog = Gtk.FileDialog(title='Send to device')
         def selected(dialog, result):
             try:
-                file = dialog.open_finish(result)
-                if file.get_path():
-                    self.execute('files', 'send', {'path': file.get_path()})
-            except GLib.Error:
-                pass
-        dialog.open(self, None, selected)
+                files = dialog.open_multiple_finish(result)
+                self.select_files([files.get_item(i) for i in range(files.get_n_items())])
+            except GLib.Error as e:
+                if not e.matches(Gtk.DialogError.quark(), Gtk.DialogError.DISMISSED):
+                    self.error(e.message)
+        dialog.open_multiple(self, None, selected)
+
+    def select_files(self, files):
+        """Picker and window drops share validation and retain files until acknowledged."""
+        accepted, errors = False, []
+        for file in files:
+            try:
+                path = file.get_path()
+                if not path:
+                    raise ValueError('Copy remote files to this computer before sending them.')
+                # The daemon opens with O_NOFOLLOW. Resolve an explicitly selected
+                # symlink first, just as unityctl send does.
+                path = Path(path).resolve(strict=True)
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError(f'{path.name}: select a file. Compress folders before sending.')
+                if info.st_size > MAX_FILE:
+                    raise ValueError(f'{path.name}: exceeds the 64 MiB file limit.')
+                name = path.name
+                if len(name.encode('utf-8')) > 255 or any(c == '\\' or ord(c) < 32 or 127 <= ord(c) <= 159 for c in name):
+                    raise ValueError(f'{name}: this filename cannot be transferred. Rename it first.')
+                path = str(path)
+                if path not in self.pending_files:
+                    self.pending_files.append(path)
+                accepted = True
+            except (OSError, RuntimeError, ValueError) as e:
+                errors.append(str(e))
+        if accepted:
+            self.file_send_error = ''
+            self.file_send_notice = ''
+            self.pages['files'].set_visible(True)
+            self.nav.select_row(self.pages['files'])
+            self.present()
+        self.render_file_selection()
+        if errors:
+            self.error('\n'.join(errors[:3]))
+        return accepted
+
+    def render_file_selection(self):
+        self.clear(self.pending_file_list)
+        for path in self.pending_files:
+            row = Adw.ActionRow(title=Path(path).name, subtitle=path)
+            row.set_title_lines(2)
+            row.set_subtitle_lines(2)
+            remove = icon_button('list-remove-symbolic', 'Remove file',
+                lambda _, p=path: self.remove_selected_file(p), 'flat')
+            remove.set_sensitive(not self.file_sending)
+            row.add_suffix(remove)
+            self.pending_file_list.append(row)
+        self.pending_file_list.set_visible(bool(self.pending_files))
+        count = len(self.pending_files)
+        self.file_send_row.set_title(f'{count} file{"s" if count != 1 else ""} selected' if count else 'No files selected')
+        device = self.devices.get(self.path, {})
+        if self.file_sending:
+            detail = f'Sending to {device.get("Name", "device")}…'
+        elif self.file_send_error:
+            detail = self.file_send_error
+        elif not self.authorized:
+            detail = 'Allow Unity access, then send your selected files.'
+        elif not device.get('Connected'):
+            detail = 'Connect a paired device, then send your selected files.'
+        elif not self.enabled('files'):
+            detail = self.capabilities.get('files', {}).get('reason') or 'Enable file transfers on both devices.'
+        else:
+            detail = self.file_send_notice or f'Ready to send to {device.get("Name", "device")}.'
+        self.file_send_row.set_subtitle(detail)
+        self.file_send_button.set_sensitive(bool(count and self.enabled('files') and not self.file_sending))
+
+    def remove_selected_file(self, path):
+        if not self.file_sending and path in self.pending_files:
+            self.pending_files.remove(path)
+            self.render_file_selection()
+
+    def send_selected_files(self, *_):
+        if self.file_sending or not self.pending_files or not self.enabled('files'):
+            return
+        self.file_sending = True
+        self.file_send_error = self.file_send_notice = ''
+        self.file_send_token += 1
+        self.send_next_file(self.file_send_token, self.path, self.generation)
+
+    def send_next_file(self, token, device, generation):
+        if token != self.file_send_token:
+            return
+        if self.path != device or self.generation != generation or not self.enabled('files'):
+            self.file_send_failed(token, 'Transfer interrupted. Reconnect and send the remaining files again.')
+            return
+        if not self.pending_files:
+            self.file_sending = False
+            self.file_send_notice = f'Files sent to {self.devices.get(device, {}).get("Name", "device")}.'
+            self.render_file_selection()
+            return
+        source = self.pending_files[0]
+        self.file_status.set_title('Preparing file…')
+        self.file_status.set_subtitle(Path(source).name)
+        self.render_file_selection()
+        def completed(result):
+            if token != self.file_send_token:
+                return
+            if result is None:
+                self.file_send_failed(token, 'Transfer failed. Your file is still selected; check the error and try again.')
+                return
+            self.pending_files.remove(source)
+            self.send_next_file(token, device, generation)
+        meta = {'feature': 'files', 'action': 'send', 'device': device, 'generation': generation,
+                'done': completed, 'quiet': False}
+        self.client.call(device, 'org.unityconnect.Transfer1', 'SendFile', '(s)', (source,),
+            lambda path: self.started(path, meta), failed=lambda message: self.file_send_failed(token, message))
+
+    def file_send_failed(self, token, message):
+        if token != self.file_send_token:
+            return
+        self.file_sending = False
+        self.file_send_error = message
+        self.file_status.set_title('Transfer failed')
+        self.file_status.set_subtitle(message)
+        self.render_file_selection()
+        self.error(message)
 
     def discover(self, *_):
         self.pairing_active = True
@@ -1282,7 +2290,10 @@ class Window(Adw.ApplicationWindow):
 
     def pairing(self, s):
         info = json.loads(s)
-        self.pair_info.set_label(f"Port: {info['port']}\nCompare this TLS fingerprint on the phone:\n{info['fingerprint']}")
+        bluetooth = info.get('bluetooth', {})
+        addresses = [a.get('address', '') for a in bluetooth.get('adapters', []) if a.get('powered')]
+        bt_text = 'Bluetooth: ' + ', '.join(addresses) if addresses else 'Bluetooth: ' + (bluetooth.get('reason') or 'Turn on Bluetooth in system settings')
+        self.pair_info.set_label(f"{bt_text}\nPort: {info['port']}\nCompare this TLS fingerprint on the phone:\n{info['fingerprint']}")
         self.clear(self.pair_requests)
         for pending in info['pending']:
             row = Adw.ActionRow(title=pending['name'], subtitle=pending['id'])
@@ -1305,7 +2316,10 @@ class Window(Adw.ApplicationWindow):
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id='org.unityconnect.Unity', flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        super().__init__(application_id='org.unityconnect.Unity', flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.add_main_option('call-popup', 0, GLib.OptionFlags.NONE, GLib.OptionArg.STRING, 'Show call controls for a phone', 'DEVICE')
+        self.add_main_option('open-messages', 0, GLib.OptionFlags.NONE, GLib.OptionArg.STRING, 'Open messages for a phone', 'DEVICE')
+        self.add_main_option('open-notifications', 0, GLib.OptionFlags.NONE, GLib.OptionArg.STRING, 'Open notifications for a phone', 'DEVICE')
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -1313,17 +2327,67 @@ class App(Adw.Application):
         quit_action.connect('activate', lambda *_: self.quit())
         self.add_action(quit_action)
         self.set_accels_for_action('app.quit', ['<primary>q'])
+        self.connect('window-added', self.add_file_drop_target)
         # Let GApplication release its registration when a launcher/session
         # manager terminates the window, just as it does for a normal close.
         GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM,
                            lambda: (self.quit(), False)[1])
 
     def do_activate(self):
-        win = self.props.active_window
+        win = next((w for w in self.get_windows() if isinstance(w, Window)), None)
         if not win:
             win = Window(self)
         win.present()
 
+    def do_command_line(self, command_line):
+        for option_name, page in [('open-messages', 'messages'), ('open-notifications', 'notifications')]:
+            target = command_line.get_options_dict().lookup_value(option_name, None)
+            if target is None: continue
+            device = target.unpack()
+            if len(device) != 32 or any(c not in '0123456789abcdef' for c in device): return 1
+            win = next((w for w in self.get_windows() if isinstance(w, Window)), None)
+            if not win: win = Window(self)
+            win.popup_only = False
+            win.popup_device = device
+            win.open_page = ('/org/unityconnect/devices/d_' + device, page)
+            win.present(); win.changed(ROOT)
+            return 0
+        option = command_line.get_options_dict().lookup_value('call-popup', None)
+        if option is None:
+            self.activate()
+            return 0
+        device = option.unpack()
+        if len(device) != 32 or any(c not in '0123456789abcdef' for c in device):
+            return 1
+        win = next((w for w in self.get_windows() if isinstance(w, Window)), None)
+        if not win:
+            win = Window(self)
+            win.popup_only = True
+            # A call can end while the verified launcher is starting.
+            GLib.timeout_add_seconds(15, lambda: (win.destroy() if win.popup_only and not win.popup_has_calls else None, False)[1])
+        win.popup_device = device
+        win.call_popup_dismissed.clear()
+        if win.path == '/org/unityconnect/devices/d_' + device:
+            win.show_call_popup(force=True)
+        else:
+            win.popup_has_calls = False
+            win.render({})
+        win.changed(ROOT)
+        return 0
+
+    def add_file_drop_target(self, app, window):
+        target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        target.set_gtypes([Gdk.FileList, Gio.File])
+        target.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        def dropped(target, value, x, y):
+            win = next((w for w in self.get_windows() if isinstance(w, Window)), None)
+            if win is None:
+                return False
+            files = value.get_files() if isinstance(value, Gdk.FileList) else [value]
+            return win.select_files(files)
+        target.connect('drop', dropped)
+        window.add_controller(target)
+
 
 if __name__ == '__main__':
-    raise SystemExit(App().run())
+    raise SystemExit(App().run(sys.argv))

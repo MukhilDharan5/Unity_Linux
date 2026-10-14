@@ -6,8 +6,8 @@ android {
   applicationId = "org.unityconnect.companion"
   minSdk = 29
   targetSdk = 35
-  versionCode = 3
-  versionName = "0.1.2"
+  versionCode = 15
+  versionName = "0.1.14"
  }
  compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
  testOptions {

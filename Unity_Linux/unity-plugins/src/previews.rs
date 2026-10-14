@@ -28,7 +28,7 @@ pub fn validate(image: &Value) -> Result<()> {
 
 // Inspect the JPEG header before clients decode it. Only ordinary 8-bit baseline
 // or progressive JPEG is accepted; huge dimensions cannot hide behind metadata.
-fn jpeg_dimensions(bytes: &[u8]) -> Result<(u64, u64)> {
+pub fn jpeg_dimensions(bytes: &[u8]) -> Result<(u64, u64)> {
     if !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
         bail!("invalid JPEG boundaries")
     }

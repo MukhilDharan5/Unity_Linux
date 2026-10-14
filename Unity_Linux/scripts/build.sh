@@ -5,6 +5,9 @@ cd "$UNITY_ROOT"
 cargo build --locked --release --workspace
 mkdir -p dist
 cp target/release/unityd target/release/unityctl dist/
+cp unity-screen/screen-capture.py dist/
+cp unity-screen/display-guard.py dist/
+cp scripts/setup-screen-sharing.py dist/
 python3 - <<'PY'
 from pathlib import Path
 import hashlib
@@ -12,7 +15,7 @@ import json
 
 directory = Path('dist')
 items = []
-for name in ('unityd', 'unityctl'):
+for name in ('unityd', 'unityctl', 'screen-capture.py', 'display-guard.py', 'setup-screen-sharing.py'):
     data = (directory / name).read_bytes()
     items.append({'file': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
 (directory / 'manifest.json').write_text(json.dumps({'version': '0.1.0', 'linux': 'x86_64', 'artifacts': items}, indent=2) + '\n')

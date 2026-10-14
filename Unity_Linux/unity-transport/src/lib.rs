@@ -1,6 +1,17 @@
 //! Interchangeable transport contract and bounded message framing.
 pub mod bluetooth;
 pub mod network;
+/// Shared encrypted stream used by LAN and RFCOMM side channels.
+pub trait StreamIo:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + std::os::fd::AsRawFd + Unpin + Send + Sync
+{
+}
+impl<
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + std::os::fd::AsRawFd + Unpin + Send + Sync,
+    > StreamIo for T
+{
+}
+pub type SecureStream = tokio_rustls::server::TlsStream<Box<dyn StreamIo>>;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use std::time::Duration;
@@ -9,19 +20,34 @@ use unity_protocol::{Message, MAX_FRAME};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Lan,
-    Ble,
+    Bluetooth,
 }
 #[derive(Debug, Clone, Copy)]
 pub enum Workload {
     Control,
     Bulk,
 }
+/// Payloads that carry files, image previews, audio or screen frames prefer LAN.
+pub fn workload(feature: &str) -> Workload {
+    if matches!(
+        feature,
+        "files" | "photos" | "browsing" | "audio" | "screen"
+    ) {
+        Workload::Bulk
+    } else {
+        Workload::Control
+    }
+}
 pub fn select(available: &[Kind], work: Workload) -> Option<Kind> {
     match work {
-        Workload::Bulk => available.iter().find(|k| **k == Kind::Lan).copied(),
+        Workload::Bulk => available
+            .iter()
+            .find(|k| **k == Kind::Lan)
+            .or_else(|| available.iter().find(|k| **k == Kind::Bluetooth))
+            .copied(),
         Workload::Control => available
             .iter()
-            .find(|k| **k == Kind::Ble)
+            .find(|k| **k == Kind::Bluetooth)
             .or_else(|| available.iter().find(|k| **k == Kind::Lan))
             .copied(),
     }
@@ -129,11 +155,18 @@ mod tests {
         ));
     }
     #[test]
-    fn bulk_never_uses_ble() {
-        assert_eq!(select(&[Kind::Ble], Workload::Bulk), None);
+    fn rfcomm_supports_bulk_and_prefers_lan_for_speed() {
         assert_eq!(
-            select(&[Kind::Lan, Kind::Ble], Workload::Control),
-            Some(Kind::Ble)
+            select(&[Kind::Bluetooth], Workload::Bulk),
+            Some(Kind::Bluetooth)
+        );
+        assert_eq!(
+            select(&[Kind::Lan, Kind::Bluetooth], Workload::Control),
+            Some(Kind::Bluetooth)
+        );
+        assert_eq!(
+            select(&[Kind::Bluetooth, Kind::Lan], Workload::Bulk),
+            Some(Kind::Lan)
         );
         assert_eq!(backoff(99).as_secs(), 64)
     }

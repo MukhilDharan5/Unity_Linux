@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 
 from gi.repository import Gio, GLib
 
@@ -21,7 +22,7 @@ def call(method, signature='()', args=()):
 
 def snapshot(*_):
     status = json.loads(call('GetAccessStatus'))
-    status.update(pid=os.getpid(), bus_name=bus.get_unique_name())
+    status.update(pid=os.getpid(), bus_name=bus.get_unique_name(), arguments=sys.argv[1:])
     temporary = state.with_suffix('.tmp')
     temporary.write_text(json.dumps(status))
     temporary.replace(state)

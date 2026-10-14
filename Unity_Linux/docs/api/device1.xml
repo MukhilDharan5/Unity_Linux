@@ -1,163 +1,222 @@
-
-<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
- "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
 <node>
   <interface name="org.freedesktop.DBus.Introspectable">
     <method name="Introspect">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
   </interface>
   <interface name="org.freedesktop.DBus.Peer">
     <method name="Ping">
     </method>
     <method name="GetMachineId">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
   </interface>
   <interface name="org.freedesktop.DBus.Properties">
     <method name="Get">
-      <arg name="interface_name" type="s" direction="in"/>
-      <arg name="property_name" type="s" direction="in"/>
-      <arg type="v" direction="out"/>
+      <arg name="interface_name" type="s" direction="in" />
+      <arg name="property_name" type="s" direction="in" />
+      <arg type="v" direction="out" />
     </method>
     <method name="Set">
-      <arg name="interface_name" type="s" direction="in"/>
-      <arg name="property_name" type="s" direction="in"/>
-      <arg name="value" type="v" direction="in"/>
+      <arg name="interface_name" type="s" direction="in" />
+      <arg name="property_name" type="s" direction="in" />
+      <arg name="value" type="v" direction="in" />
     </method>
     <method name="GetAll">
-      <arg name="interface_name" type="s" direction="in"/>
-      <arg type="a{sv}" direction="out"/>
+      <arg name="interface_name" type="s" direction="in" />
+      <arg type="a{sv}" direction="out" />
     </method>
     <signal name="PropertiesChanged">
-      <arg name="interface_name" type="s"/>
-      <arg name="changed_properties" type="a{sv}"/>
-      <arg name="invalidated_properties" type="as"/>
+      <arg name="interface_name" type="s" />
+      <arg name="changed_properties" type="a{sv}" />
+      <arg name="invalidated_properties" type="as" />
     </signal>
   </interface>
   <interface name="org.unityconnect.Clipboard1">
     <method name="GetText">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
     <method name="SetText">
-      <arg name="text" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="text" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
   </interface>
   <interface name="org.unityconnect.Device1">
     <method name="GetState">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
     <method name="Execute">
-      <arg name="feature" type="s" direction="in"/>
-      <arg name="action" type="s" direction="in"/>
-      <arg name="payload_json" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="feature" type="s" direction="in" />
+      <arg name="action" type="s" direction="in" />
+      <arg name="payload_json" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="Disconnect">
     </method>
     <method name="SetFeatureEnabled">
-      <arg name="feature" type="s" direction="in"/>
-      <arg name="enabled" type="b" direction="in"/>
+      <arg name="feature" type="s" direction="in" />
+      <arg name="enabled" type="b" direction="in" />
     </method>
     <signal name="StateChanged">
     </signal>
-    <property name="CapabilitiesJson" type="s" access="read"/>
-    <property name="Connected" type="b" access="read"/>
-    <property name="Id" type="s" access="read"/>
-    <property name="Name" type="s" access="read"/>
+    <property name="CapabilitiesJson" type="s" access="read" />
+    <property name="Connected" type="b" access="read" />
+    <property name="Id" type="s" access="read" />
+    <property name="Name" type="s" access="read" />
   </interface>
   <interface name="org.unityconnect.Media1">
     <method name="Control">
-      <arg name="action" type="s" direction="in"/>
-      <arg name="position_ms" type="t" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="action" type="s" direction="in" />
+      <arg name="position_ms" type="t" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="GetSnapshot">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
   </interface>
   <interface name="org.unityconnect.Notification1">
     <method name="GetSnapshot">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
     <method name="Dismiss">
-      <arg name="id" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="id" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="Reply">
-      <arg name="id" type="s" direction="in"/>
-      <arg name="action" type="s" direction="in"/>
-      <arg name="text" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="id" type="s" direction="in" />
+      <arg name="action" type="s" direction="in" />
+      <arg name="text" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="Invoke">
-      <arg name="id" type="s" direction="in"/>
-      <arg name="action" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="id" type="s" direction="in" />
+      <arg name="action" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
   </interface>
   <interface name="org.unityconnect.RemoteInput1">
     <method name="Text">
-      <arg name="text" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="text" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="Gesture">
-      <arg name="action" type="s" direction="in"/>
-      <arg name="x" type="d" direction="in"/>
-      <arg name="y" type="d" direction="in"/>
-      <arg name="end_x" type="d" direction="in"/>
-      <arg name="end_y" type="d" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="action" type="s" direction="in" />
+      <arg name="x" type="d" direction="in" />
+      <arg name="y" type="d" direction="in" />
+      <arg name="end_x" type="d" direction="in" />
+      <arg name="end_y" type="d" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+  </interface>
+  <interface name="org.unityconnect.Screen1">
+    <signal name="FrameAvailable">
+      <arg name="sequence" type="t" />
+    </signal>
+    <method name="GetFrame">
+      <arg type="t" direction="out" />
+      <arg type="u" direction="out" />
+      <arg type="u" direction="out" />
+      <arg type="ay" direction="out" />
     </method>
   </interface>
   <interface name="org.unityconnect.Sharing1">
     <method name="ShareUrl">
-      <arg name="url" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="url" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="ListPhotos">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
     <method name="GetPhotoPreview">
-      <arg name="id" type="s" direction="in"/>
-      <arg name="edge" type="u" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="id" type="s" direction="in" />
+      <arg name="edge" type="u" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="ListFiles">
-      <arg name="id" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="id" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="GetFile">
-      <arg name="feature" type="s" direction="in"/>
-      <arg name="id" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="feature" type="s" direction="in" />
+      <arg name="id" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
   </interface>
   <interface name="org.unityconnect.Telephony1">
     <method name="ListMessages">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
     <method name="SendSms">
-      <arg name="address" type="s" direction="in"/>
-      <arg name="body" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="address" type="s" direction="in" />
+      <arg name="body" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="ControlCall">
-      <arg name="action" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="action" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="GetSnapshot">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
+    </method>
+    <method name="ListConversation">
+      <arg name="address" type="s" direction="in" />
+      <arg name="offset" type="u" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="Dial">
+      <arg name="number" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="ListContacts">
+      <arg name="query" type="s" direction="in" />
+      <arg name="offset" type="u" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="ListRecentCalls">
+      <arg name="offset" type="u" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="ControlCallById">
+      <arg name="action" type="s" direction="in" />
+      <arg name="call_id" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="SendTone">
+      <arg name="call_id" type="s" direction="in" />
+      <arg name="tone" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="SetMuted">
+      <arg name="muted" type="b" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="SetAudioRoute">
+      <arg name="route" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="ListAudioDevices">
+      <arg type="s" direction="out" />
+    </method>
+    <method name="StartDesktopAudio">
+      <arg name="address" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="StopDesktopAudio">
+      <arg type="s" direction="out" />
+    </method>
+    <method name="SelectDesktopAudioDevices">
+      <arg name="output" type="s" direction="in" />
+      <arg name="microphone" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
   </interface>
   <interface name="org.unityconnect.Transfer1">
     <method name="SendFile">
-      <arg name="path" type="s" direction="in"/>
-      <arg type="s" direction="out"/>
+      <arg name="path" type="s" direction="in" />
+      <arg type="s" direction="out" />
     </method>
     <method name="GetSnapshot">
-      <arg type="s" direction="out"/>
+      <arg type="s" direction="out" />
     </method>
   </interface>
 </node>

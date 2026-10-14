@@ -15,7 +15,7 @@ The installed GTK launcher is the trusted CLI's `launch-gtk` command. It starts 
 | ApiVersion property | — | u32 = 1 |
 | ListDevices | — | array of object paths; redacted public metadata |
 | StartDiscovery | u32 seconds | open explicit pairing window, 1..120 |
-| PairingInfo | — | JSON: fingerprint, port, pending id/name pairs; requires control |
+| PairingInfo | — | JSON: fingerprint, port, pending id/name pairs, Bluetooth status/adapters; requires control |
 | ApprovePairing | string device_id, bool approve | approve/reject pending phone |
 | Unpair | string device_id | revoke credential and close live session |
 | RequestAccess | string name, array<string> scopes | requesting unique bus name |
@@ -40,8 +40,9 @@ Public properties: `Id` and `Name` strings, `Connected` boolean, `CapabilitiesJs
 | Notification1 | GetSnapshot; Dismiss(id); Reply(id,action,text); Invoke(id,action) |
 | Clipboard1 | GetText (JSON `{text}` or null); SetText(text) |
 | Transfer1 | SendFile(absolute_local_path); GetSnapshot |
+| Screen1 | GetFrame → (u64 sequence, u32 width, u32 height, byte-array JPEG); FrameAvailable(u64 sequence) signal |
 | Media1 | Control(action,u64 position_ms); GetSnapshot |
-| Telephony1 | ListMessages; SendSms(address,body); ControlCall(action, currently Unsupported); GetSnapshot |
+| Telephony1 | ListMessages; SendSms(address,body); ListConversation(address,offset); Dial(number); ListContacts(query,offset); ListRecentCalls(offset); ControlCall(action); ControlCallById(action,call_id); SendTone(call_id,tone); SetMuted(bool); SetAudioRoute(route); ListAudioDevices; StartDesktopAudio(address); StopDesktopAudio; SelectDesktopAudioDevices(output,microphone); GetSnapshot (see [telephony](telephony.md)) |
 | RemoteInput1 | Text(text); Gesture(action,double x,y,end_x,end_y) |
 | Sharing1 | ShareUrl(url); ListPhotos; GetPhotoPreview(id,u32 edge); ListFiles(id); GetFile(feature,id), feature photos or browsing |
 
@@ -72,3 +73,5 @@ paths = call('/org/unityconnect/Manager', 'org.unityconnect.Manager1', 'ListDevi
 This synchronous example is appropriate for a small terminal script. GUI clients should use asynchronous D-Bus calls as Unity GTK does. No phone transport library, GTK dependency, or internal core crate is needed to build a KDE widget, GNOME extension, or terminal client.
 
 `Sharing1.GetPhotoPreview(id,edge)` returns an owned operation path. Its completed result contains `{id,preview:{mime,width,height,data}}` with a bounded base64 JPEG. It requires the same read/control grant and photo capability as original retrieval. All artwork and preview bytes travel through the authorized API; GTK never opens a phone connection. `Device1.Execute("sms","list",{"address":"..."})` retrieves a selected conversation using a provider-bound query. `sms.revision` events invalidate the open Messages view without polling. Media snapshots optionally include album, app_name, duration, active, supported actions, and artwork; clients must tolerate absent fields from an older companion.
+
+`Device1.Execute("screen","start",{"source":"phone"})` or source `desktop` starts a consent-based share; `Execute("screen","stop",{})` ends it. `Execute("lock","lock",{})` locks the phone after Android admin approval. Screen1.GetFrame requires read and returns only the latest frame of a live phone share; unavailable frames return an error. FrameAvailable is metadata-only; clients fetch asynchronously and keep at most one pending fetch. See [screen/lock setup](screen-and-lock.md).

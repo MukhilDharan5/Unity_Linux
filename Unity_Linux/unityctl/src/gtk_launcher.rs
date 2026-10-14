@@ -73,16 +73,22 @@ async fn approve_child(
     Ok(())
 }
 
-pub async fn launch(bus: &zbus::Connection, manager: &zbus::Proxy<'_>) -> Result<()> {
+pub async fn launch(
+    bus: &zbus::Connection,
+    manager: &zbus::Proxy<'_>,
+    target: Option<(&str, &str)>,
+) -> Result<()> {
     let script = checked_script(&std::env::current_exe()?)?;
     // Subscribe before spawning: RequestAccess can arrive before spawn returns.
     let mut changes = manager.receive_signal("AccessRequested").await?;
     let dbus = zbus::fdo::DBusProxy::new(bus).await?;
     let mut owners = dbus.receive_name_owner_changed().await?;
-    let mut child = Command::new("/usr/bin/python3")
-        .arg(script)
-        .kill_on_drop(true)
-        .spawn()?;
+    let mut command = Command::new("/usr/bin/python3");
+    command.arg(script).kill_on_drop(true);
+    if let Some((option, device)) = target {
+        command.arg(format!("--{option}={device}"));
+    }
+    let mut child = command.spawn()?;
     let pid = child.id().context("GTK child has no PID")?;
     // Never inspect or grant requests after the child exits (avoids PID reuse).
     loop {

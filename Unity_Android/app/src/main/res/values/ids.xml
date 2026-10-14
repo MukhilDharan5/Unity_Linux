@@ -1,4 +1,5 @@
 <resources>
+ <item name="feature_audio" type="id"/>
  <item type="id" name="unity_root"/>
  <item type="id" name="page_overview"/>
  <item type="id" name="page_sharing"/>
@@ -26,4 +27,19 @@
  <item type="id" name="feature_sms"/>
  <item type="id" name="appearance_row"/>
  <item type="id" name="forget_computer_row"/>
+ <item name="lock_computer_button" type="id" />
+ <item name="share_phone_screen" type="id" />
+ <item name="view_computer_screen" type="id" />
+ <item name="stop_screen_share" type="id" />
+ <item name="feature_lock" type="id" />
+ <item name="feature_screen" type="id" />
+ <item name="activate_phone_lock" type="id" />
+ <item type="id" name="bluetooth_address"/>
+ <item type="id" name="choose_bluetooth_computer"/>
+ <item type="id" name="connection_method"/>
+ <item name="received_notification_settings" type="id" />
+ <item name="computer_screen_view" type="id" />
+ <item name="screen_keyboard_toggle" type="id" />
+ <item name="screen_display_toggle" type="id" />
+ <item name="view_computer_display_off" type="id" />
 </resources>

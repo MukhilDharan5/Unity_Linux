@@ -227,7 +227,7 @@ impl Manager {
     }
     async fn pairing_info(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
         self.access.require(&h, "control").await?;
-        Ok(json!({"fingerprint":self.engine.identity.fingerprint,"port":self.engine.port,"pending":self.engine.pending_pairs().await}).to_string())
+        Ok(json!({"fingerprint":self.engine.identity.fingerprint,"port":self.engine.port,"pending":self.engine.pending_pairs().await,"bluetooth":self.engine.bluetooth_info().await}).to_string())
     }
     async fn approve_pairing(
         &self,
@@ -322,7 +322,7 @@ impl Manager {
     async fn diagnostics(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
         self.access.require(&h, "read").await?;
         let devices = self.engine.devices().await;
-        Ok(json!({"api_version":1,"protocol_version":1,"devices":devices.iter().map(|d|json!({"id":d.id,"connected":d.connected,"last_error":d.last_error})).collect::<Vec<_>>(),"bluetooth":"BlueZ inspection available; authenticated BLE data channel not implemented","lan":"TLS with certificate pinning and device challenge authentication","pairing":"explicit 120-second maximum window"}).to_string())
+        Ok(json!({"api_version":1,"protocol_version":1,"devices":devices.iter().map(|d|json!({"id":d.id,"connected":d.connected,"last_error":d.last_error})).collect::<Vec<_>>(),"bluetooth":self.engine.bluetooth_info().await,"lan":"TLS with certificate pinning and device challenge authentication","pairing":"explicit 120-second maximum window"}).to_string())
     }
     async fn list_operations(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
         let owner = self.access.require(&h, "read").await?;
@@ -559,6 +559,151 @@ impl Media {
 struct Telephony(Context);
 #[interface(name = "org.unityconnect.Telephony1")]
 impl Telephony {
+    async fn list_conversation(
+        &self,
+        address: &str,
+        offset: u32,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "sms",
+                "list",
+                &json!({"address":address,"offset":offset}).to_string(),
+            )
+            .await
+    }
+    async fn dial(&self, number: &str, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "call_control",
+                "dial",
+                &json!({"number":number}).to_string(),
+            )
+            .await
+    }
+    async fn list_contacts(
+        &self,
+        query: &str,
+        offset: u32,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "call_control",
+                "contacts",
+                &json!({"query":query,"offset":offset}).to_string(),
+            )
+            .await
+    }
+    async fn list_recent_calls(
+        &self,
+        offset: u32,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "call_control",
+                "history",
+                &json!({"offset":offset}).to_string(),
+            )
+            .await
+    }
+    async fn control_call_by_id(
+        &self,
+        action: &str,
+        call_id: &str,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "call_control",
+                action,
+                &json!({"call_id":call_id}).to_string(),
+            )
+            .await
+    }
+    async fn send_tone(
+        &self,
+        call_id: &str,
+        tone: &str,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "call_control",
+                "dtmf",
+                &json!({"call_id":call_id,"tone":tone}).to_string(),
+            )
+            .await
+    }
+    async fn set_muted(&self, muted: bool, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "call_control",
+                "mute",
+                &json!({"muted":muted}).to_string(),
+            )
+            .await
+    }
+    async fn set_audio_route(
+        &self,
+        route: &str,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "call_control",
+                "route",
+                &json!({"route":route}).to_string(),
+            )
+            .await
+    }
+    async fn list_audio_devices(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
+        self.0
+            .execute(&h, "call_control", "audio_devices", "{}")
+            .await
+    }
+    async fn start_desktop_audio(
+        &self,
+        address: &str,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "call_control",
+                "audio_start",
+                &json!({"address":address}).to_string(),
+            )
+            .await
+    }
+    async fn stop_desktop_audio(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
+        self.0.execute(&h, "call_control", "audio_stop", "{}").await
+    }
+    async fn select_desktop_audio_devices(
+        &self,
+        output: &str,
+        microphone: &str,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<String, Error> {
+        self.0
+            .execute(
+                &h,
+                "call_control",
+                "audio_select",
+                &json!({"output":output,"microphone":microphone}).to_string(),
+            )
+            .await
+    }
     async fn list_messages(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
         self.0.execute(&h, "sms", "list", "{}").await
     }
@@ -585,7 +730,21 @@ impl Telephony {
         self.0.execute(&h, "call_control", action, "{}").await
     }
     async fn get_snapshot(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
-        self.0.snapshot(&h, Some("call_notifications")).await
+        self.0.access.require(&h, "read").await?;
+        let device = self.0.engine.device(&self.0.id).await.map_err(err)?;
+        if !device.connected {
+            return Err(Error::Disconnected("Phone is disconnected".into()));
+        }
+        let mut snapshot = device
+            .state
+            .get("call_notifications")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        for feature in ["call_notifications", "call_control", "call_audio", "sms"] {
+            snapshot[feature] = device.state.get(feature).cloned().unwrap_or(Value::Null);
+        }
+        Ok(snapshot.to_string())
     }
 }
 struct RemoteInput(Context);
@@ -665,6 +824,23 @@ impl Sharing {
             .await
     }
 }
+struct Screen(Context);
+#[interface(name = "org.unityconnect.Screen1")]
+impl Screen {
+    #[zbus(signal)]
+    async fn frame_available(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        sequence: u64,
+    ) -> zbus::Result<()>;
+    async fn get_frame(
+        &self,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<(u64, u32, u32, Vec<u8>), Error> {
+        self.0.access.require(&h, "read").await?;
+        let frame = self.0.engine.screen_frame(&self.0.id).await.map_err(err)?;
+        Ok((frame.sequence, frame.width, frame.height, frame.jpeg))
+    }
+}
 async fn register_device(engine: Arc<Engine>, access: Arc<Access>, id: String) -> Result<()> {
     let path = device_path(&id);
     let c = Context {
@@ -680,6 +856,7 @@ async fn register_device(engine: Arc<Engine>, access: Arc<Access>, id: String) -
     server.at(path.clone(), Media(c.clone())).await?;
     server.at(path.clone(), Telephony(c.clone())).await?;
     server.at(path.clone(), RemoteInput(c.clone())).await?;
+    server.at(path.clone(), Screen(c.clone())).await?;
     server.at(path, Sharing(c)).await?;
     Ok(())
 }
@@ -718,6 +895,28 @@ pub async fn serve(engine: Arc<Engine>) -> Result<Connection> {
         }
     });
     let connection = bus.clone();
+    let mut frames = engine.screen_changed.subscribe();
+    let frame_bus = bus.clone();
+    tokio::spawn(async move {
+        loop {
+            match frames.recv().await {
+                Ok((id, sequence)) => {
+                    frame_bus
+                        .emit_signal(
+                            None::<&str>,
+                            device_path(&id).as_str(),
+                            "org.unityconnect.Screen1",
+                            "FrameAvailable",
+                            &(sequence,),
+                        )
+                        .await
+                        .ok();
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
     let mut changes = engine.changed.subscribe();
     tokio::spawn(async move {
         loop {
@@ -765,6 +964,7 @@ pub async fn serve(engine: Arc<Engine>) -> Result<Connection> {
                             server.remove::<Telephony, _>(p.as_str()).await.ok();
                             server.remove::<RemoteInput, _>(p.as_str()).await.ok();
                             server.remove::<Sharing, _>(p.as_str()).await.ok();
+                            server.remove::<Screen, _>(p.as_str()).await.ok();
                         }
                         connection.emit_signal(None::<&str>,p.as_str(),"org.freedesktop.DBus.Properties","PropertiesChanged",&("org.unityconnect.Device1",std::collections::HashMap::<String,zbus::zvariant::Value<'_>>::new(),vec!["Name","Connected","CapabilitiesJson"])).await.ok();
                         connection

@@ -17,6 +17,7 @@ import unittest
 
 import gi
 from gi.repository import Gio, GLib
+from fake_notifications import FakeNotifications
 
 ROOT = Path(__file__).resolve().parents[1]
 BUS = 'org.unityconnect'
@@ -37,13 +38,13 @@ def wait_for(predicate, timeout=5):
 
 
 class Peer:
-    def __init__(self, port, fingerprint, secret=None):
+    def __init__(self, port, fingerprint, secret=None, stream=None):
         # A test-only pin verifier; production Android verifies in X509TrustManager before application data.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         context.minimum_version = ssl.TLSVersion.TLSv1_3
-        self.sock = context.wrap_socket(socket.create_connection(('127.0.0.1', port)), server_hostname='unity.local')
+        self.sock = context.wrap_socket(stream if stream is not None else socket.create_connection(('127.0.0.1', port)), server_hostname='unity.local')
         self.sock.settimeout(5)
         assert hashlib.sha256(self.sock.getpeercert(binary_form=True)).hexdigest() == fingerprint
         self.send({'type': 'hello', 'version': 1, 'device_id': DEVICE, 'name': 'Integration peer', 'capabilities': CAPS})
@@ -87,6 +88,7 @@ class Peer:
 class Integration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.notices = FakeNotifications()
         cls.temp = tempfile.TemporaryDirectory(prefix='unity-integration-')
         cls.dir = Path(cls.temp.name)
         cls.bin = cls.dir / 'bin'; cls.bin.mkdir()
@@ -114,6 +116,13 @@ class Integration(unittest.TestCase):
             'org.freedesktop.DBus', 'ListNames', None, None, Gio.DBusCallFlags.NONE, 1000, None).unpack()[0])
         probe.close_sync(None)
         wait_for(lambda: cls.cli('diagnose', check=False).returncode == 0)
+        # The D-Bus interface is exported before the network listener binds.
+        # Wait for that listener too, including after a test daemon restart.
+        def listening():
+            with socket.socket() as connection:
+                connection.settimeout(.2)
+                return connection.connect_ex(('127.0.0.1', cls.port)) == 0
+        wait_for(listening)
 
     @classmethod
     def cli(cls, *args, check=True):
@@ -131,26 +140,30 @@ class Integration(unittest.TestCase):
         for bus in (cls.bus, cls.other):
             if not bus.is_closed(): bus.close_sync(None)
         cls.temp.cleanup()
+        cls.notices.close()
+
+    def create_peer(self, port, fingerprint, secret=None):
+        return Peer(port, fingerprint, secret)
 
     def test_end_to_end(self):
         # Pairing window cannot be opened by an arbitrary session-bus caller.
         with self.assertRaises(GLib.Error):
             self.call(self.bus, MANAGER, 'org.unityconnect.Manager1', 'StartDiscovery', '(u)', (120,))
         info = json.loads(self.cli('discover').stdout)
-        peer = Peer(self.port, info['fingerprint'])
+        peer = self.create_peer(self.port, info['fingerprint'])
         self.assertTrue(peer.pending)
         wait_for(lambda: json.loads(self.cli('pairing').stdout)['pending'])
         self.cli('pair', DEVICE)
         pair = peer.read(); self.assertEqual(pair['type'], 'pair_result')
         secret = pair['secret']; peer.close()
         self.assertEqual((self.state / 'trust.json').stat().st_mode & 0o777, 0o600)
-        peer = Peer(self.port, info['fingerprint'], secret)
+        peer = self.create_peer(self.port, info['fingerprint'], secret)
         path = '/org/unityconnect/devices/d_' + DEVICE
         wait_for(lambda: 'connected' in self.cli('list').stdout)
         caps = json.loads(self.cli('capabilities', DEVICE).stdout)
-        self.assertEqual(len(caps), 21)
-        for feature in ('screen', 'call_control'):
-            self.assertEqual(next(c for c in caps if c['id'] == feature)['status'], 'unsupported')
+        self.assertEqual(len(caps), 23)
+        for feature in ('call_control',):
+            self.assertEqual(next(c for c in caps if c['id'] == feature)['status'], 'available')
         # Private phone state is blocked before an explicit client grant.
         with self.assertRaises(GLib.Error):
             self.call(self.bus, path, 'org.unityconnect.Device1', 'GetState')
@@ -161,6 +174,12 @@ class Integration(unittest.TestCase):
         peer.event('battery', {'level': 73, 'charging': True})
         peer.event('network', {'kind': 'wifi', 'signal': 3, 'operator': 'Test'})
         wait_for(lambda: json.loads(self.cli('status', DEVICE).stdout)['state'].get('battery', {}).get('level') == 73)
+        battery = {'level': 73, 'charging': False, 'plugged': False, 'status': 'discharging',
+                   'voltage_v': 3.8, 'current_ma': -500.0, 'power_w': 1.9, 'remaining_seconds': 21600,
+                   'estimate_kind': 'empty', 'estimate_source': 'charge_counter', 'estimate_state': 'available'}
+        peer.event('battery', battery)
+        wait_for(lambda: json.loads(self.cli('battery', DEVICE).stdout).get('power_w') == 1.9)
+        self.assertEqual(json.loads(self.cli('battery', DEVICE).stdout), battery)
         # Photos use a bounded preview operation instead of transferring originals.
         photo = 'ef' * 16
         preview = {'mime': 'image/jpeg', 'width': 256, 'height': 192,
@@ -200,7 +219,7 @@ class Integration(unittest.TestCase):
             out = ROOT / 'docs/api'; out.mkdir(exist_ok=True)
             for name, object_path in [('manager', MANAGER), ('device', path), ('operation', op)]:
                 xml = self.call(self.bus, object_path, 'org.freedesktop.DBus.Introspectable', 'Introspect')
-                (out / f'{name}1.xml').write_text(xml + '\n')
+                (out / f'{name}1.xml').write_text(xml.rstrip() + '\n')
         cmd = peer.read(); self.assertEqual(cmd['action'], 'ring')
         peer.sock.sendall(header[2:] + fragmented)
         wait_for(lambda: json.loads(self.cli('battery', DEVICE).stdout).get('level') == 74)
@@ -218,6 +237,15 @@ class Integration(unittest.TestCase):
         peer.event('files', {'id': transfer, 'phase': 'end'})
         received = self.state / 'received' / (transfer + '-received.bin')
         wait_for(received.exists); self.assertEqual(received.read_bytes(), data)
+        # A provider/send failure aborts its partial file without disconnecting.
+        aborted = 'bc' * 16
+        peer.event('files', {'id': aborted, 'phase': 'begin', 'name': 'cancelled.bin', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        partial = self.state / 'received' / ('.' + aborted + '.part')
+        wait_for(partial.exists)
+        peer.event('files', {'id': aborted, 'phase': 'abort'})
+        wait_for(lambda: not partial.exists())
+        wait_for(lambda: json.loads(self.cli('status', DEVICE).stdout)['state']['files']['state'] == 'cancelled')
+        self.assertIn('connected', self.cli('list').stdout)
         # Linux->phone transfer uses the same operation and sends exact bytes.
         source = self.dir / 'source.bin'; source.write_bytes(data)
         op2 = self.call(self.bus, path, 'org.unityconnect.Transfer1', 'SendFile', '(s)', (str(source),))
@@ -229,6 +257,10 @@ class Integration(unittest.TestCase):
             messages.append(m)
             if m['action'] == 'end': break
         self.assertEqual(messages[0]['action'], 'begin')
+        chunk_limit = getattr(self, 'outgoing_chunk_limit', 49152)
+        chunks = [base64.b64decode(m['data']['data']) for m in messages if m['action'] == 'chunk']
+        self.assertTrue(all(0 < len(chunk) <= chunk_limit for chunk in chunks))
+        self.assertEqual(len(chunks), (len(data) + chunk_limit - 1) // chunk_limit)
         self.assertEqual(b''.join(base64.b64decode(m['data']['data']) for m in messages if m['action'] == 'chunk'), data)
         peer.send({'type': 'result', 'id': messages[-1]['id'], 'ok': True, 'data': {'state': 'received'}, 'error': ''})
         wait_for(lambda: json.loads(self.call(self.bus, op2, 'org.unityconnect.Operation1', 'GetState'))['status'] == 'completed')
@@ -249,11 +281,11 @@ class Integration(unittest.TestCase):
         # Trust survives daemon restart, live state does not.
         self.daemon.terminate(); self.daemon.wait(timeout=5); self.log.close()
         self.start_daemon()
-        peer = Peer(self.port, info['fingerprint'], secret)
-        self.assertEqual(json.loads(self.cli('status', DEVICE).stdout)['state'], {})
+        peer = self.create_peer(self.port, info['fingerprint'], secret)
+        self.assertEqual(list(json.loads(self.cli('status', DEVICE).stdout)['state']), ['transport'])
         # Wrong credentials never establish a session, and unpairing cancels an existing one.
         with self.assertRaises((EOFError, ssl.SSLError, ConnectionError)):
-            Peer(self.port, info['fingerprint'], '00' * 32)
+            self.create_peer(self.port, info['fingerprint'], '00' * 32)
         self.cli('unpair', DEVICE)
         wait_for(lambda: not self.cli('list').stdout.strip())
         with self.assertRaises((EOFError, ssl.SSLError, ConnectionError)): peer.read()

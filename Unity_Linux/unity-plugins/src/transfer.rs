@@ -120,6 +120,12 @@ impl Receiver {
                 std::fs::rename(&t.path, &final_path)?;
                 return Ok(Some(final_path));
             }
+            "abort" => {
+                if let Some(t) = self.incoming.remove(id) {
+                    drop(t.file);
+                    std::fs::remove_file(t.path)?;
+                }
+            }
             _ => bail!("unknown transfer phase"),
         }
         Ok(None)
@@ -156,6 +162,29 @@ mod tests {
         let p = r.event(&json!({"phase":"end","id":id})).unwrap().unwrap();
         assert_eq!(std::fs::read(p).unwrap(), b"hello");
         drop(r);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn aborted_transfer_is_removed_and_can_be_retried() {
+        let root =
+            std::env::temp_dir().join(format!("unity-transfer-abort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut receiver = Receiver::new(root.clone()).unwrap();
+        let id = "02".repeat(16);
+        let begin = json!({"phase":"begin","id":id,"name":"empty.bin","size":0,
+                          "sha256":format!("{:x}", Sha256::digest(b""))});
+        receiver.event(&begin).unwrap();
+        assert!(root.join(format!(".{id}.part")).exists());
+        receiver.event(&json!({"phase":"abort","id":id})).unwrap();
+        assert!(!root.join(format!(".{id}.part")).exists());
+        receiver.event(&json!({"phase":"abort","id":id})).unwrap();
+        receiver.event(&begin).unwrap();
+        let path = receiver
+            .event(&json!({"phase":"end","id":id}))
+            .unwrap()
+            .unwrap();
+        assert!(std::fs::read(path).unwrap().is_empty());
+        drop(receiver);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

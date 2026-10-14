@@ -1,12 +1,21 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
  <uses-feature android:name="android.hardware.telephony" android:required="false" />
+ <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+ <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+ <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
  <uses-permission android:name="android.permission.INTERNET" />
  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
  <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+ <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+ <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+ <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
  <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+ <uses-permission android:name="android.permission.CALL_PHONE" />
+ <uses-permission android:name="android.permission.READ_CALL_LOG" />
+ <uses-permission android:name="android.permission.READ_CONTACTS" />
  <uses-permission android:name="android.permission.SEND_SMS" />
  <uses-permission android:name="android.permission.READ_SMS" />
  <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
@@ -20,7 +29,24 @@
    <intent-filter><action android:name="android.intent.action.SEND"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="text/plain"/></intent-filter>
    <intent-filter><action android:name="android.intent.action.SEND"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="*/*"/></intent-filter>
   </activity>
-  <service android:name=".CompanionService" android:exported="false" android:foregroundServiceType="connectedDevice"/>
+  <activity android:name=".ReceivedItemActivity" android:exported="false" android:excludeFromRecents="true" />
+  <activity android:name=".ScreenConsentActivity" android:exported="false" />
+  <activity android:name=".ScreenViewerActivity" android:exported="false" />
+  <activity android:name=".DialerActivity" android:exported="true">
+   <intent-filter><action android:name="android.intent.action.DIAL"/><category android:name="android.intent.category.DEFAULT"/></intent-filter>
+   <intent-filter><action android:name="android.intent.action.DIAL"/><category android:name="android.intent.category.DEFAULT"/><data android:scheme="tel"/></intent-filter>
+  </activity>
+  <activity android:name=".PhoneCallActivity" android:exported="false" android:launchMode="singleTask" android:excludeFromRecents="true" />
+  <receiver android:name=".PhoneCallAction" android:exported="false" />
+  <service android:name=".UnityInCallService" android:permission="android.permission.BIND_INCALL_SERVICE" android:exported="true">
+   <meta-data android:name="android.telecom.IN_CALL_SERVICE_UI" android:value="true" />
+   <intent-filter><action android:name="android.telecom.InCallService"/></intent-filter>
+  </service>
+  <receiver android:name=".UnityDeviceAdmin" android:permission="android.permission.BIND_DEVICE_ADMIN" android:exported="true" android:label="Unity phone locking">
+   <meta-data android:name="android.app.device_admin" android:resource="@xml/device_admin" />
+   <intent-filter><action android:name="android.app.action.DEVICE_ADMIN_ENABLED" /></intent-filter>
+  </receiver>
+  <service android:name=".CompanionService" android:exported="false" android:foregroundServiceType="connectedDevice|mediaPlayback|mediaProjection"/>
   <service android:name=".PhoneNotifications" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" android:exported="true">
    <intent-filter><action android:name="android.service.notification.NotificationListenerService"/></intent-filter>
   </service>

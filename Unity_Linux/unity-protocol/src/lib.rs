@@ -41,6 +41,24 @@ impl Capability {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
+    ScreenHello {
+        version: u32,
+        device_id: String,
+        token: String,
+    },
+    /// A paired phone can request only explicitly supported desktop actions.
+    Request {
+        id: String,
+        feature: String,
+        action: String,
+        data: Value,
+    },
+    /// One-use session token delivered over the authenticated control connection.
+    AudioHello {
+        version: u32,
+        device_id: String,
+        token: String,
+    },
     Hello {
         version: u32,
         device_id: String,

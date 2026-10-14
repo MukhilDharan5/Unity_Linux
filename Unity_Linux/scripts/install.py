@@ -38,6 +38,11 @@ def text(dst, value, mode=0o644):
 if a.component in ('all', 'daemon'):
     for name in ('unityd', 'unityctl'):
         copy(root / 'target' / ('debug' if a.debug else 'release') / name, libexec / name, 0o755)
+    copy(root / 'unity-screen/screen-capture.py', libexec / 'screen-capture.py', 0o644)
+    copy(root / 'unity-screen/display-guard.py', libexec / 'display-guard.py', 0o644)
+    copy(root / 'scripts/setup-screen-sharing.py', libexec / 'setup-screen-sharing.py', 0o644)
+    text(prefix / 'share/applications/org.unityconnect.Unity.Screen.desktop',
+         (root / 'packaging/org.unityconnect.Unity.Screen.desktop').read_text().replace('@LIBEXEC@', str(libexec)))
     bindir = stage(prefix / 'bin'); bindir.mkdir(parents=True, exist_ok=True)
     ctl = bindir / 'unityctl'
     if ctl.exists() or ctl.is_symlink(): ctl.unlink()
@@ -52,6 +57,7 @@ if a.component in ('all', 'daemon'):
         value = value.replace(f'Exec={libexec}/unityd', f'Exec="{libexec}/unityd"')
         text(dest, value)
 if a.component in ('all', 'gtk'):
+    copy(root / 'scripts/setup-call-popup.py', libexec / 'setup-call-popup.py', 0o644)
     copy(root / 'unity-gtk/unity.py', prefix / 'share/unity/unity.py', 0o644)
     text(prefix / 'bin/unity-gtk', '#!/usr/bin/env python3\nimport os\nos.execv(' + repr(str(libexec / 'unityctl')) + ', ["unityctl", "launch-gtk"])\n', 0o755)
     copy(root / 'packaging/org.unityconnect.Unity.desktop', prefix / 'share/applications/org.unityconnect.Unity.desktop', 0o644)

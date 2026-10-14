@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Unity Screen Sharing
+Comment=Share the desktop with your paired Unity phone
+Exec=/usr/bin/python3 @LIBEXEC@/screen-capture.py
+Icon=org.unityconnect.Unity
+NoDisplay=true
+Categories=Network;

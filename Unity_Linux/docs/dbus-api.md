@@ -1,5 +1,7 @@
 # Public D-Bus API v1
 
+The optional [Firefox companion](firefox-companion.md) adds manager methods `FirefoxStatus() -> s` (JSON, read grant), `SetFirefoxEnabled(b)` (control grant) and `RestoreFirefoxContext(ss) -> s` (profile ID, context ID, returning a command ID; control grant). An empty context ID selects the last active checkpoint. `Changed` signals cover connection, summary and restore-result changes. Summaries are local and volatile; the enable flag persists.
+
 Bus: **session bus**. Name: `org.unityconnect`. Root: `/org/unityconnect/Manager`. API interfaces end in `1`; compatible additions preserve these interfaces, breaking changes require a new numbered interface. The daemon publishes standard `Introspectable`, `Peer`, and `Properties` interfaces through zbus. Generated introspection XML is in `docs/api/`.
 
 Device paths: `/org/unityconnect/devices/d_<32-hex-ID>`. Operation paths: `/org/unityconnect/operations/o_<32-hex-ID>`. Returned device enumeration uses D-Bus object paths; feature methods currently return operation paths as strings. Operations are owned by the connection that created them. Keep that connection alive while waiting for the result.
@@ -75,3 +77,7 @@ This synchronous example is appropriate for a small terminal script. GUI clients
 `Sharing1.GetPhotoPreview(id,edge)` returns an owned operation path. Its completed result contains `{id,preview:{mime,width,height,data}}` with a bounded base64 JPEG. It requires the same read/control grant and photo capability as original retrieval. All artwork and preview bytes travel through the authorized API; GTK never opens a phone connection. `Device1.Execute("sms","list",{"address":"..."})` retrieves a selected conversation using a provider-bound query. `sms.revision` events invalidate the open Messages view without polling. Media snapshots optionally include album, app_name, duration, active, supported actions, and artwork; clients must tolerate absent fields from an older companion.
 
 `Device1.Execute("screen","start",{"source":"phone"})` or source `desktop` starts a consent-based share; `Execute("screen","stop",{})` ends it. `Execute("lock","lock",{})` locks the phone after Android admin approval. Screen1.GetFrame requires read and returns only the latest frame of a live phone share; unavailable frames return an error. FrameAvailable is metadata-only; clients fetch asynchronously and keep at most one pending fetch. See [screen/lock setup](screen-and-lock.md).
+
+Device1 `GetState` includes `media` (phone primary metadata plus optional native `players`) and `desktop_media` (`origin:"desktop",players`). Device1 `Execute("desktop_media", action, JSON)` targets a native laptop player locally using `session`, plus `track_id` and millisecond `position` for seeks. Existing connection, feature and control-grant checks apply. See [media synchronization](media-sync.md).
+
+Device1.GetState adds `sound` (phone volume) and `desktop_sound` (laptop output). Device1.Execute routes the `sound` feature by `source:phone|desktop`; volume is 0..100, mute is an absolute boolean, and laptop mutations require the current `output` ID. See [device volume](device-volume.md).

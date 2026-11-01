@@ -49,7 +49,10 @@ class TestApp(module.App):
         self.set_flags(Gio.ApplicationFlags.NON_UNIQUE)
 
     def do_activate(self):
-        activated(self)
+        try:
+            activated(self)
+        except Exception as error:
+            failures.append(error); traceback.print_exc(); self.quit()
 
 
 app = TestApp()
@@ -61,14 +64,19 @@ cases = [('calls', 1140, 820, False), ('calls', 420, 740, False), ('overview', 1
          ('photos', 420, 740, False), ('notifications', 420, 740, False), ('remote', 420, 740, False), ('remote', 1140, 820, False), ('photos', 1140, 820, True),
          ('files', 1140, 820, False), ('files', 420, 740, False), ('overview', 420, 740, False)]
 index = 0
+snapshot_attempts = 0
 
 def capture():
-    global index
+    global index, snapshot_attempts
     try:
         name, width, height, dark = cases[index]
-        assert len(win.pages) == 9
+        assert len(win.pages) == 11
+        assert win.sidebar_toolbar.get_top_bar_style() == Adw.ToolbarStyle.FLAT
+        assert win.content_toolbar.get_top_bar_style() == Adw.ToolbarStyle.FLAT
+        assert win.sidebar_header.is_ancestor(win.sidebar_toolbar)
+        assert win.content_header.is_ancestor(win.content_toolbar)
         assert win.ringer_combo.is_ancestor(win.stack.get_child_by_name('media'))
-        assert win.hotspot_button.is_ancestor(win.stack.get_child_by_name('media'))
+        assert win.hotspot_button.is_ancestor(win.stack.get_child_by_name('connectivity'))
         assert not win.ringer_combo.is_ancestor(win.stack.get_child_by_name('remote'))
         assert win.pages['messages'].page_title == 'Messages'
         assert win.pages['photos'].page_title == 'Photos'
@@ -81,9 +89,27 @@ def capture():
         assert sum(1 for _ in win.photo_widgets.values()) == 8
         assert all(w['texture'] is not None for w in win.photo_widgets.values())
         assert win.preview_inflight <= 2
+        # Broadway can invalidate AdwDialogHost's allocation during a theme/size change.
+        win.get_child().allocate(win.get_width(), win.get_height(), -1, None)
         paintable = Gtk.WidgetPaintable.new(win); snapshot = Gtk.Snapshot()
         paintable.snapshot(snapshot, win.get_width(), win.get_height())
-        texture = win.get_renderer().render_texture(snapshot.to_node(), Graphene.Rect().init(0, 0, win.get_width(), win.get_height()))
+        node = snapshot.to_node()
+        if node is None:
+            # GNOME can throttle the native frame cache while another window
+            # covers this fixture; snapshot the real child tree directly.
+            snapshot = Gtk.Snapshot()
+            win.snapshot_child(win.get_child(), snapshot)
+            node = snapshot.to_node()
+        if node is None and snapshot_attempts < 10:
+            # A theme/size change can invalidate a paintable until the next
+            # frame, especially on GNOME and a virtual Broadway display.
+            snapshot_attempts += 1
+            win.queue_draw()
+            GLib.timeout_add(100, capture)
+            return False
+        assert node is not None, 'Window did not render after a theme/size change'
+        snapshot_attempts = 0
+        texture = win.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, win.get_width(), win.get_height()))
         out = Path(f'/tmp/unity-refined-{name}-{width}{"-dark" if dark else ""}.png')
         texture.save_to_png(str(out))
         print(f'Rendered {name}: {win.get_width()}×{win.get_height()} to {out}', flush=True)
@@ -93,13 +119,18 @@ def capture():
     if index < len(cases):
         GLib.idle_add(next_case)
     else:
-        # Sensitive views are cleared on disconnect, and previews use two bounded requests.
-        win.render({})
-        assert not win.photo_items and not win.message_data
-        assert win.art_picture.get_paintable() is None
-        assert not win.battery_power.get_visible() and not win.battery_time.get_visible()
-        assert win.battery_power.get_label() == win.battery_time.get_label() == ''
-        app.activate_action('quit', None)
+        try:
+            # Sensitive views are cleared on disconnect, and previews use two bounded requests.
+            win.render({})
+            assert not win.photo_items and not win.message_data
+            assert win.art_picture.get_paintable() is None
+            assert not win.battery_power.get_visible()
+            assert win.battery_power.get_label() == ''
+            assert 'Connect and enable' in win.clip_status.get_subtitle()
+        except Exception as error:
+            failures.append(error); traceback.print_exc()
+        finally:
+            app.activate_action('quit', None)
     return False
 
 def next_case():
@@ -132,7 +163,7 @@ def activated(application):
     assert not any(method == 'GetState' for method, _ in win.client.calls)
     win.bus_name = ':1.test'
     win.error('GDBus.Error:org.unityconnect.Error.NotAuthorized: private test error')
-    assert win.banner.get_title() == 'Allow Unity to access your phone.'
+    assert win.banner.get_title() == 'Allow Unity to access your devices and browser.'
     assert win.banner.get_button_label() == 'Allow access'
     assert 'GDBus' not in win.access_row.get_subtitle()
     assert not win.discovery_button.get_sensitive()
@@ -156,15 +187,14 @@ def activated(application):
     win.authorized = True
     win.messages_loaded = win.photos_loaded = True
     win.render_battery({'level': 50, 'charging': False})
-    assert 'Update the Android companion' in win.battery_time.get_label()
+    assert win.battery_power.get_label() == 'Power draw unavailable'
     win.render_battery({'level': 50, 'charging': True, 'status': 'charging', 'power_w': -4.,
                         'remaining_seconds': 4500, 'estimate_kind': 'full', 'estimate_state': 'available', 'estimate_source': 'android'})
     assert win.battery_power.get_label() == 'Charging · 4.00 W'
-    assert win.battery_time.get_label() == 'Estimated · 1 h 15 min to full'
     win.render_battery({'level': 50, 'charging': False, 'power_w': None, 'remaining_seconds': None, 'estimate_state': 'collecting'})
-    assert win.battery_power.get_label() == 'Power not reported by phone'
-    assert win.battery_time.get_label() == 'Estimating time remaining…'
+    assert win.battery_power.get_label() == 'Power draw unavailable'
     win.render({'connected': True, 'name': 'Test phone', 'state': {
+        'clipboard': {'text': 'Shared text · தமிழ்'},
         'transport': {'kind': 'both', 'links': ['bluetooth', 'lan'], 'control': 'bluetooth', 'bulk': 'lan'},
         'battery': {'level': 76, 'charging': False, 'status': 'discharging', 'plugged': False, 'power_w': 1.9,
                     'remaining_seconds': 21600, 'estimate_kind': 'empty', 'estimate_state': 'available', 'estimate_source': 'charge_counter'},
@@ -179,7 +209,9 @@ def activated(application):
                     'actions': [{'id': '0', 'title': 'Snooze', 'reply': False}, {'id': '1', 'title': 'Open', 'reply': False}]},
         }, 'media': {'title': 'Evening Light', 'artist': 'The Coastline', 'album': 'A place to return', 'app_name': 'Music', 'active': True,
                       'playing': True, 'duration': 241000, 'position': 84000, 'artwork': preview, 'actions': ['play','pause','next','previous','seek']}}})
-    assert 'Bluetooth + Wi-Fi / LAN' in win.connection_detail.get_label()
+    assert win.connection_value.get_label() == 'LAN + Bluetooth connected'
+    assert 'automatically in both directions' in win.clip_status.get_subtitle()
+    assert win.clip_receive.get_label() == 'Shared text · தமிழ்'
     assert win.call_phone_button.get_visible() and win.call_uses_hfp
     assert win.call_audio_active and win.call_audio_muted
     assert win.call_audio_button.get_label() == 'Stop computer audio'
@@ -188,9 +220,7 @@ def activated(application):
     assert win.call_audio_selection['microphone'] == 'laptop_microphone'
     # Rebuilding selector models must never submit a routing operation.
     assert not any(method == 'Execute' and args[:2] == ('call_control', 'audio_select') for method,args in win.client.calls)
-    assert 'Controls over Bluetooth' in win.connection_detail.get_label()
-    assert win.battery_power.get_label() == 'Battery draw · 1.90 W'
-    assert win.battery_time.get_label() == 'Estimated · 6 h 0 min left'
+    assert win.battery_power.get_label() == 'Power draw · 1.90 W'
     win.show_messages({'messages': [
         {'id': '1', 'address': '+1 555 0100', 'body': 'Are we still meeting this afternoon?', 'direction': 'incoming', 'timestamp': 1791800100000},
         {'id': '2', 'address': '+1 555 0100', 'body': 'Yes! I’ll be there at four.', 'direction': 'outgoing', 'timestamp': 1791800300000},
@@ -220,7 +250,7 @@ def activated(application):
     assert win.screen_control_switch.get_active()
     win.screen_blank_switch.set_active(True)
     win.start_screen('desktop')
-    assert any(method == 'Execute' and args[:2] == ('screen', 'start') and json.loads(args[2]) == {'source':'desktop','control':True,'blank_display':True} for method,args in win.client.calls)
+    assert any(method == 'Execute' and args[:2] == ('screen', 'start') and json.loads(args[2]) == {'source':'desktop','control':True,'blank_display':True,'extend_display':False} for method,args in win.client.calls)
     win.render_screen({'source':'desktop','state':'streaming','session_id':'ab'*16,'input_enabled':True,'display_available':True,'display_on':False})
     assert win.laptop_display_button.get_sensitive() and win.laptop_display_button.get_label() == 'Turn on'
     win.toggle_laptop_display()

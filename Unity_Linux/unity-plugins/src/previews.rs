@@ -5,23 +5,70 @@ use serde_json::Value;
 
 pub const MAX_BYTES: usize = 32 * 1024;
 pub const MAX_EDGE: u64 = 320;
+pub const MEDIA_MAX_EDGE: u64 = 1024;
+pub const MEDIA_MAX_BYTES: usize = 192 * 1024;
+
+/// Negotiation only. Artwork updates use their originating media feature so
+/// the same pairing and media opt-in checks apply to metadata and cover data.
+pub struct MediaArtworkFeature;
+impl crate::Plugin for MediaArtworkFeature {
+    fn spec(&self) -> crate::Spec {
+        crate::Spec {
+            id: "media_artwork",
+            title: "High quality media artwork",
+            group: "media",
+            sensitive: true,
+            blocked: "",
+            actions: &[],
+        }
+    }
+    fn command(&self, action: &str, data: &Value) -> Result<()> {
+        crate::validate_command(self.spec(), action, data)
+    }
+    fn event(&self, _: &Value) -> Result<()> {
+        bail!("Artwork requires an originating media session")
+    }
+}
 
 pub fn validate(image: &Value) -> Result<()> {
+    validate_limits(image, MAX_EDGE, MAX_BYTES)
+}
+pub fn validate_media(image: &Value) -> Result<()> {
+    validate_limits(image, MEDIA_MAX_EDGE, MEDIA_MAX_BYTES)
+}
+fn validate_limits(image: &Value, max_edge: u64, max_bytes: usize) -> Result<()> {
     if image["mime"] != "image/jpeg" {
         bail!("preview must be JPEG")
     }
     let width = image["width"].as_u64().context("missing preview width")?;
     let height = image["height"].as_u64().context("missing preview height")?;
-    if !(1..=MAX_EDGE).contains(&width) || !(1..=MAX_EDGE).contains(&height) {
+    if !(1..=max_edge).contains(&width) || !(1..=max_edge).contains(&height) {
         bail!("preview dimensions exceed limit")
     }
     let encoded = image["data"].as_str().context("missing preview bytes")?;
-    if encoded.len() > MAX_BYTES.div_ceil(3) * 4 {
+    if encoded.len() > max_bytes.div_ceil(3) * 4 {
         bail!("preview exceeds byte limit")
     }
     let bytes = STANDARD.decode(encoded)?;
-    if bytes.len() > MAX_BYTES || jpeg_dimensions(&bytes)? != (width, height) {
+    if bytes.len() > max_bytes || jpeg_dimensions(&bytes)? != (width, height) {
         bail!("preview dimensions do not match JPEG")
+    }
+    Ok(())
+}
+
+pub fn validate_media_update(value: &Value) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    if value["origin"] != "phone"
+        || !unity_protocol::valid_id(super::text(value, "session", 32)?)
+        || super::text(value, "track_id", 1024).is_err()
+    {
+        bail!("invalid artwork identity")
+    }
+    let image = &value["artwork"];
+    validate_media(image)?;
+    let bytes = STANDARD.decode(image["data"].as_str().unwrap())?;
+    if super::text(value, "artwork_id", 64)? != format!("{:x}", Sha256::digest(bytes)) {
+        bail!("artwork identity does not match image")
     }
     Ok(())
 }
@@ -102,6 +149,23 @@ mod tests {
         let mut oversized = image(256);
         oversized["data"] = json!("A".repeat(50000));
         assert!(validate(&oversized).is_err());
+    }
+    #[test]
+    fn media_covers_have_a_separate_budget_and_verified_content_identity() {
+        use sha2::{Digest, Sha256};
+        let cover = image(1024);
+        assert!(validate_media(&cover).is_ok());
+        assert!(validate(&cover).is_err());
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(STANDARD.decode(cover["data"].as_str().unwrap()).unwrap())
+        );
+        let mut update = json!({"kind":"artwork","origin":"phone","session":"a".repeat(32),"track_id":"track-1","artwork_id":digest,"artwork":cover});
+        assert!(validate_media_update(&update).is_ok());
+        update["artwork_id"] = json!("0".repeat(64));
+        assert!(validate_media_update(&update).is_err());
+        update["artwork"] = image(8192);
+        assert!(validate_media_update(&update).is_err());
     }
     #[test]
     fn rejects_bad_photo_requests_and_results() {

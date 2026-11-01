@@ -133,9 +133,9 @@ class ScreenIntegration(unittest.TestCase):
         harness.wait_for(lambda:self.operation(op)['status']=='completed')
         return op, stream, command
 
-    def start_desktop(self):
+    def start_desktop(self, extended=False):
         def begin():
-            try: return self.execute('start', {'source':'desktop', 'control':True})
+            try: return self.execute('start', {'source':'desktop', 'control':True, 'blank_display':not extended,'extend_display':extended})
             except GLib.Error as error:
                 if 'Stop the current screen share first' in str(error): return None
                 raise
@@ -144,7 +144,10 @@ class ScreenIntegration(unittest.TestCase):
         stream = self.screen_socket(command['data']['token']); self.ready(stream)
         length, = struct.unpack('>I',self.exact(stream,4)); self.exact(stream,length)
         harness.wait_for(lambda:self.operation(op)['status']=='completed')
-        harness.wait_for(lambda:self.screen_state().get('display_available'))
+        harness.wait_for(lambda:self.screen_state().get('extended_display' if extended else 'display_available'))
+        self.assertEqual(command['data']['blank_display'],not extended)
+        options=json.loads((self.dir / 'screen-options.json').read_text())
+        self.assertEqual(options['phone_display'],not extended); self.assertEqual(options['extended_display'],extended)
         return op, stream, command
 
     def screen_state(self):
@@ -154,6 +157,8 @@ class ScreenIntegration(unittest.TestCase):
         result = self.request('screen','display',{'session_id':command['data']['request_id'], 'on':False})
         self.assertTrue(result['ok'], result)
         self.assertEqual((self.dir / 'fake-panel').read_text(), '0')
+        if command['data'].get('blank_display'):
+            harness.wait_for(lambda:self.screen_state().get('phone_primary') is True)
 
     def restored(self):
         harness.wait_for(lambda:(self.dir / 'fake-panel').read_text() == '72')
@@ -190,6 +195,15 @@ class ScreenIntegration(unittest.TestCase):
         harness.wait_for(lambda:json.loads(self.cli('status',harness.DEVICE).stdout)['state']['battery']['level']==80)
         stop = self.execute('stop'); harness.wait_for(lambda:self.operation(stop)['status']=='completed'); stream.close()
         with self.assertRaises(GLib.Error): self.frame()
+        # Extension is a separate desktop, not an instruction to blank the physical panel.
+        _, extended_stream, extended_command=self.start_desktop(extended=True)
+        self.assertTrue(extended_command['data']['extend_display'])
+        self.assertEqual((self.dir/'fake-panel').read_text(),'72')
+        self.assertFalse(self.screen_state()['display_available'])
+        self.assertFalse(self.request('screen','display',{'session_id':extended_command['data']['request_id'],'on':False})['ok'])
+        self.assertEqual((self.dir/'fake-panel').read_text(),'72')
+        stop=self.execute('stop'); harness.wait_for(lambda:self.operation(stop)['status']=='completed')
+        extended_stream.close(); self.restored()
         self.check_transport_disconnect()
         # A phone can initiate either direction; the start operation remains owned by that phone.
         response = self.request('screen','start',{'source':'desktop'}); self.assertTrue(response['ok'])

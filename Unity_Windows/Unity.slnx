@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations><Platform Name="x64"/></Configurations>
+  <Folder Name="/src/">
+    <Project Path="src/Unity.Core/Unity.Core.csproj" />
+    <Project Path="src/Unity.Platform/Unity.Platform.csproj" />
+    <Project Path="src/Unity.Windows/Unity.Windows.csproj" />
+  </Folder>
+  <Folder Name="/tests/"><Project Path="tests/Unity.Tests/Unity.Tests.csproj" /></Folder>
+</Solution>

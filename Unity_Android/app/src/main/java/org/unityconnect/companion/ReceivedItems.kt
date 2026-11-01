@@ -1,6 +1,5 @@
 package org.unityconnect.companion
 
-import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,12 +9,10 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.content.res.Configuration
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
-import android.os.Build
 import android.view.View
-import android.view.WindowInsets
 import android.webkit.MimeTypeMap
 import android.widget.ScrollView
 import android.widget.Toast
@@ -38,7 +35,8 @@ internal object ReceivedItems {
  fun mime(name: String) = MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase(java.util.Locale.ROOT)) ?: "application/octet-stream"
  fun file(context: Context, uri: Uri, name: String) {
   require(uri.scheme == "content")
-  notify(context, "file", uri.toString(), name, mime(name), "File received", name, "Open file")
+  val type=runCatching {context.contentResolver.getType(uri)}.getOrNull()?.takeIf {it!="application/octet-stream"} ?: mime(name)
+  notify(context, "file", uri.toString(), name, type, "File received", name, "Open file")
  }
  fun link(context: Context, url: String) {
   validateUrl(url)
@@ -58,8 +56,13 @@ internal object ReceivedItems {
   val item = UUID.randomUUID().toString()
   val intent = Intent(context, ReceivedItemActivity::class.java).setData(Uri.parse("unity-received://item/$item"))
    .putExtra(KIND, kind).putExtra(VALUE, value).putExtra(NAME, name).putExtra(MIME, mime)
-   .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-  val pending = PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+   .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+  // Known files open in the viewer directly, with the creator's read-only grant.
+  val target=if(kind=="file") runCatching {
+   viewerIntent(intent).takeIf {context.packageManager.resolveActivity(it,PackageManager.MATCH_DEFAULT_ONLY)!=null}
+    ?.apply {putExtras(intent.extras!!);addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)}
+  }.getOrNull() ?: intent else intent
+  val pending = PendingIntent.getActivity(context, item.hashCode(), target, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
   val notification = Notification.Builder(context, CHANNEL).setSmallIcon(R.drawable.ic_unity_symbolic)
    .setContentTitle(title).setContentText(body).setStyle(Notification.BigTextStyle().bigText(body))
    .setContentIntent(pending).setAutoCancel(true).setVisibility(Notification.VISIBILITY_PRIVATE)
@@ -89,18 +92,21 @@ internal object ReceivedItems {
 }
 
 /** An activity keeps notification taps compatible with Android's background launch restrictions. */
-class ReceivedItemActivity : Activity() {
+class ReceivedItemActivity : AdwaitaActivity() {
  private lateinit var value: String
- override fun attachBaseContext(base: Context) {
-  val config = Configuration(base.resources.configuration)
-  when (base.getSharedPreferences("settings", MODE_PRIVATE).getString("appearance", "system")) {
-   "light" -> config.uiMode = (config.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or Configuration.UI_MODE_NIGHT_NO
-   "dark" -> config.uiMode = (config.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or Configuration.UI_MODE_NIGHT_YES
-  }
-  super.attachBaseContext(base.createConfigurationContext(config))
- }
+ private var attempted=false
+ private var opening=false
+ private var foreground=false
  override fun onCreate(saved: Bundle?) {
   super.onCreate(saved)
+  attempted=saved?.takeIf {it.getString("item")==intent.dataString}?.getBoolean("attempted") ?: false
+  showItem()
+ }
+ override fun onNewIntent(intent:Intent) {
+  super.onNewIntent(intent);setIntent(intent);attempted=false;opening=false;showItem()
+  if(foreground) postOpen()
+ }
+ private fun showItem() {
   value = intent.getStringExtra(ReceivedItems.VALUE).orEmpty()
   if (intent.getStringExtra(ReceivedItems.KIND) == "text") {
    if (ReceivedItems.copying(intent)) {
@@ -108,10 +114,25 @@ class ReceivedItemActivity : Activity() {
    }
    showText(); return
   }
-  try { startActivity(ReceivedItems.viewerIntent(intent)); finish() }
-  catch (_: ActivityNotFoundException) { showFallback() }
-  catch (e: Exception) { Toast.makeText(this, e.message ?: "Received item unavailable", Toast.LENGTH_LONG).show(); finish() }
+  val ui=AdwaitaUi(this)
+  val content=ui.column().apply {setPadding(ui.dp(24),ui.dp(24),ui.dp(24),ui.dp(24))}
+  content.addView(ui.label(intent.getStringExtra(ReceivedItems.NAME) ?: "Received file",24f,true))
+  content.addView(ui.label("Opening the received item…",secondary=true).apply {setPadding(0,ui.dp(16),0,ui.dp(16))})
+  content.addView(ui.button("Open",true) {openItem()});showContent(content)
  }
+ override fun onPostResume() {super.onPostResume();foreground=true;postOpen()}
+ private fun postOpen() {
+  if(intent.getStringExtra(ReceivedItems.KIND)=="text" || attempted || isFinishing) return
+  window.decorView.post {if(foreground && !attempted && !isFinishing) openItem()}
+ }
+ private fun openItem() {
+  attempted=true;opening=true
+  try { startActivity(ReceivedItems.viewerIntent(intent)) }
+  catch (_: ActivityNotFoundException) { showFallback() }
+  catch (e: Exception) {opening=false;showUnavailable(e.message ?: "Received item unavailable")}
+ }
+ override fun onPause() {foreground=false;super.onPause();if(opening) finish()}
+ override fun onSaveInstanceState(out:Bundle) {out.putString("item",intent.dataString);out.putBoolean("attempted",attempted);super.onSaveInstanceState(out)}
  private fun copyText() {
   getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Unity", value))
   Toast.makeText(this, "Text copied", Toast.LENGTH_SHORT).show()
@@ -125,6 +146,7 @@ class ReceivedItemActivity : Activity() {
   showContent(content)
  }
  private fun showFallback() {
+  opening=false
   val ui = AdwaitaUi(this)
   val file = intent.getStringExtra(ReceivedItems.KIND) == "file"
   val content = ui.column().apply { setPadding(ui.dp(24), ui.dp(24), ui.dp(24), ui.dp(24)) }
@@ -134,24 +156,22 @@ class ReceivedItemActivity : Activity() {
    runCatching {
     val view = ReceivedItems.viewerIntent(intent)
     if (file) view.setDataAndType(Uri.parse(value), "*/*")
-    startActivity(Intent.createChooser(view, if (file) "Open received file" else "Open received link"))
-   }.onFailure { Toast.makeText(this, if (file) "Install an app that supports this file type" else "Install a browser to open this link", Toast.LENGTH_LONG).show() }
+    opening=true
+    startActivity(Intent.createChooser(view, if (file) "Open received file" else "Open received link").apply {
+     if(file) {addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);clipData=view.clipData}
+    })
+   }.onFailure { opening=false;Toast.makeText(this, if (file) "Install an app that supports this file type" else "Install a browser to open this link", Toast.LENGTH_LONG).show() }
   })
   showContent(content)
  }
- @Suppress("DEPRECATION")
+ private fun showUnavailable(message:String) {
+  val ui=AdwaitaUi(this);val content=ui.column().apply {setPadding(ui.dp(24),ui.dp(24),ui.dp(24),ui.dp(24))}
+  content.addView(ui.label("Received item unavailable",24f,true))
+  content.addView(ui.label(message,secondary=true).apply {setPadding(0,ui.dp(16),0,ui.dp(16))})
+  content.addView(ui.button("Try opening again",true) {openItem()});showContent(content)
+ }
  private fun showContent(content: View) {
-  if (Build.VERSION.SDK_INT >= 30) window.setDecorFitsSystemWindows(false)
-  else @Suppress("DEPRECATION") run { window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION }
   val scroll = ScrollView(this).apply { addView(content) }
-  setContentView(scroll)
-  scroll.setOnApplyWindowInsetsListener { view, insets ->
-   if (Build.VERSION.SDK_INT >= 30) {
-    val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
-    view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-   } else @Suppress("DEPRECATION") run { view.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop, insets.systemWindowInsetRight, insets.systemWindowInsetBottom) }
-   insets
-  }
-  scroll.requestApplyInsets()
+  setContentView(scroll); applyInsets(scroll)
  }
 }

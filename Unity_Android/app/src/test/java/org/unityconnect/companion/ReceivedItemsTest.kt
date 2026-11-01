@@ -3,6 +3,8 @@ package org.unityconnect.companion
 import android.app.NotificationManager
 import android.content.ClipboardManager
 import android.content.Intent
+import android.content.pm.ActivityInfo
+import android.content.pm.ResolveInfo
 import android.net.Uri
 import android.os.Looper
 import android.graphics.Insets
@@ -35,9 +37,11 @@ class ReceivedItemsTest {
    assertEquals("https://example.org/first", intent.getStringExtra(ReceivedItems.VALUE))
    assertTrue(first.contentIntent.isImmutable)
    val activity = Robolectric.buildActivity(ReceivedItemActivity::class.java, intent).setup()
+   shadowOf(Looper.getMainLooper()).idle()
    val opened = shadowOf(activity.get()).nextStartedActivity
    assertEquals(Intent.ACTION_VIEW, opened.action); assertEquals("https://example.org/first", opened.dataString)
-   assertTrue(activity.get().isFinishing); activity.destroy()
+   assertFalse(activity.get().isFinishing)
+   activity.pause();assertTrue(activity.get().isFinishing);activity.stop().destroy()
    val channel = app.getSystemService(NotificationManager::class.java).getNotificationChannel(ReceivedItems.CHANNEL)
    assertEquals(NotificationManager.IMPORTANCE_HIGH, channel.importance)
   } finally { controller.destroy() }
@@ -59,6 +63,38 @@ class ReceivedItemsTest {
   val intent = shadowOf(notices().single().contentIntent).savedIntent
   assertEquals("application/octet-stream", ReceivedItems.viewerIntent(intent).type)
   assertEquals("தமிழ்.unknown", intent.getStringExtra(ReceivedItems.NAME))
+ }
+ @Test fun supportedFilesUseADirectViewerPendingIntentWithTheOriginalReadGrant() {
+  val uri=Uri.parse("content://media/external_primary/downloads/43")
+  val view=Intent(Intent.ACTION_VIEW).setDataAndType(uri,"application/pdf")
+  val handler=ResolveInfo().apply {activityInfo=ActivityInfo().apply {packageName="org.example.viewer";name="PdfActivity";exported=true}}
+  shadowOf(app.packageManager).addResolveInfoForIntent(view,handler)
+  ReceivedItems.file(app,uri,"first.pdf")
+  val first=notices().single();val intent=shadowOf(first.contentIntent).savedIntent
+  ReceivedItems.file(app,Uri.parse("content://media/external_primary/downloads/44"),"second.pdf")
+  assertTrue(first.contentIntent.isImmutable)
+  assertEquals(Intent.ACTION_VIEW,intent.action);assertNull(intent.component)
+  assertEquals(uri,intent.data);assertEquals("application/pdf",intent.type)
+  assertEquals(uri,intent.clipData!!.getItemAt(0).uri)
+  assertTrue(intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION!=0)
+  assertEquals(0,intent.flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+  assertEquals("first.pdf",intent.getStringExtra(ReceivedItems.NAME))
+ }
+ @Test fun aWarmReceiptActivityOpensTheNewItemOnlyAfterItResumes() {
+  ReceivedItems.link(app,"https://example.org/one")
+  val first=shadowOf(notices().single().contentIntent).savedIntent
+  val activity=Robolectric.buildActivity(ReceivedItemActivity::class.java,first).create().start()
+  assertNull(shadowOf(activity.get()).nextStartedActivity)
+  activity.resume().visible();shadowOf(Looper.getMainLooper()).idle()
+  assertEquals("https://example.org/one",shadowOf(activity.get()).nextStartedActivity.dataString)
+  // Delivery while the activity is already on top must consume the new target.
+  ReceivedItems.link(app,"https://example.org/two")
+  val second=notices().first {shadowOf(it.contentIntent).savedIntent.getStringExtra(ReceivedItems.VALUE)=="https://example.org/two"}
+  activity.newIntent(shadowOf(second.contentIntent).savedIntent)
+  shadowOf(Looper.getMainLooper()).idle()
+  assertEquals("https://example.org/two",shadowOf(activity.get()).nextStartedActivity.dataString)
+  assertNull(shadowOf(activity.get()).nextStartedActivity)
+  activity.pause().stop().destroy()
  }
  @Test fun receivedTextOpensAndCopiesItsOriginalSnapshotAfterAnotherShare() {
   ReceivedItems.text(app, "First shared text தமிழ்")

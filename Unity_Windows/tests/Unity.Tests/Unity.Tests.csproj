@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0-windows10.0.26100.0</TargetFramework><SupportedOSPlatformVersion>10.0.22000.0</SupportedOSPlatformVersion></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../src/Unity.Core/Unity.Core.csproj"/><ProjectReference Include="../../src/Unity.Platform/Unity.Platform.csproj"/></ItemGroup>
+  <ItemGroup><None Include="../fixtures/preview.jpg" Link="preview.jpg" CopyToOutputDirectory="PreserveNewest"/></ItemGroup>
+</Project>

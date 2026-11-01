@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["unityd", "unity-core", "unity-protocol", "unity-transport", "unity-security", "unity-plugins", "unity-ipc", "unityctl"]
+members = ["unityd", "unity-core", "unity-protocol", "unity-transport", "unity-security", "unity-plugins", "unity-ipc", "unityctl", "unity-auth", "unity-pam"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -16,6 +16,7 @@ futures-lite = "2"
 hmac = "0.12"
 libc = "0.2"
 rand = "0.8"
+ring = "0.17"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }

@@ -47,6 +47,9 @@ restore_audio() {
 trap restore_audio EXIT
 # Release the native HFP registration before oFono registers the same role.
 if [[ "$UNITY_CALL_RUNNING" == true ]]; then systemctl --user stop wireplumber.service; fi
-"${UNITY_CALL_SUDO[@]}" systemctl enable --now ofono.service
+"${UNITY_CALL_SUDO[@]}" systemctl enable ofono.service
+# Package installation may already have started oFono while WirePlumber still
+# owned HFP. Restart after releasing that registration, even if oFono is active.
+"${UNITY_CALL_SUDO[@]}" systemctl restart ofono.service
 if [[ "$UNITY_CALL_RUNNING" == true ]]; then systemctl --user start wireplumber.service; fi
 printf 'Bluetooth call backend configured. Reconnect the phone in Bluetooth settings, enable Calls for this computer, and choose it in Unity → Calls.\n'

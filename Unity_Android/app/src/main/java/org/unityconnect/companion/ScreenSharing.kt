@@ -27,14 +27,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 import kotlin.math.sqrt
 
-internal data class ScreenRequest(val id: String, val token: String, val source: String, val control: Boolean = false, val blankDisplay: Boolean = false) {
+internal data class ScreenRequest(val id: String, val token: String, val source: String, val control: Boolean = false, val blankDisplay: Boolean = false, val extendDisplay: Boolean = false) {
  companion object {
   fun parse(data: JSONObject): ScreenRequest {
    val id = data.getString("request_id"); val token = data.getString("token"); val source = data.getString("source")
    require(Protocol.validId(id) && token.length == 64 && token.all { it in "0123456789abcdef" })
    require(source in listOf("phone", "desktop") && data.getString("format") == "jpeg")
    require(data.getInt("max_edge") == 1280 && data.getInt("max_pixels") == 921600 && data.getInt("max_bytes") == 262144 && data.getInt("fps") == 15)
-   return ScreenRequest(id, token, source, data.optBoolean("control", false), data.optBoolean("blank_display", false))
+   for (key in listOf("control", "blank_display", "extend_display")) if (data.has(key)) require(data.get(key) is Boolean) { "Invalid display option" }
+   val blank = data.optBoolean("blank_display", false); val extend = data.optBoolean("extend_display", false)
+   require(!(blank && extend) && (source == "desktop" || (!blank && !extend))) { "Choose a desktop primary or extended display" }
+   return ScreenRequest(id, token, source, data.optBoolean("control", false), blank, extend)
   }
  }
 }
@@ -89,6 +92,10 @@ class ScreenSharing(service: CompanionService) : Module(service, "screen") {
   private set
  @Volatile var displayOn = true
   private set
+ @Volatile var phonePrimary = false
+  private set
+ @Volatile var extendedDisplay = false
+  private set
  @Volatile var controlError = ""
   private set
  fun active() = current != null
@@ -101,6 +108,8 @@ class ScreenSharing(service: CompanionService) : Module(service, "screen") {
   if (action == "state") {
    if (current?.request?.id == data.optString("request_id") && source() == "desktop") {
     inputEnabled = data.optBoolean("input_enabled"); displayAvailable = data.optBoolean("display_available")
+    phonePrimary = data.optBoolean("phone_primary", false)
+    extendedDisplay = data.optBoolean("extended_display", false)
     displayOn = data.optBoolean("display_on", true); controlError = data.optString("display_error").take(512)
     main.post { maybeBlank(); service.uiChanged() }
    }
@@ -206,7 +215,7 @@ class ScreenSharing(service: CompanionService) : Module(service, "screen") {
   val session = synchronized(this) { current.also { current = null; bitmap = null; state = if (error.isBlank()) "stopped" else "failed"; lastError = error.take(512) } }
   session?.close()
   main.post { session?.inputQueue?.clear(); session?.inputSending = false }
-  inputEnabled = false; displayAvailable = false; displayOn = true; controlError = ""
+  inputEnabled = false; displayAvailable = false; displayOn = true; phonePrimary = false; extendedDisplay = false; controlError = ""
   consentOpen = false; viewerOpen = false; projectionForeground = false
   service.getSystemService(NotificationManager::class.java).cancel(730)
   service.refreshForeground(); service.uiChanged()

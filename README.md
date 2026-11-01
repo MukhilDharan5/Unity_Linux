@@ -1,5 +1,13 @@
 # Unity
 
+Companion **0.1.36** and the matching Linux update support [Bluetooth plus the phone's own Wi-Fi hotspot](Unity_Linux/docs/direct-hotspot.md), including changing hotspot addresses and recovery from a stale router connection. Unity's local features do not need a separate router or internet access.
+
+Companion **0.1.35** adds a desktop [Connectivity tab](Unity_Linux/docs/connectivity.md): observed phone Mobile Hotspot state, connected Bluetooth devices sent from the phone, and Samsung routine switches for Mobile Hotspot and disconnecting a selected device.
+
+Companion **0.1.34** adds [Samsung Routines triggers](Unity_Linux/docs/samsung-routines.md) for hotspot on/off and disconnecting a phone-configured Bluetooth device, with matching desktop controls.
+
+Companion **0.1.33** and matching desktop updates add [automatic clipboard sync](Unity_Linux/docs/clipboard-sync.md) with no send/receive buttons. Android background sending uses authorized Shizuku access while keeping your current keyboard; incoming text is applied automatically.
+
 Unity is a local-first companion platform with two independent projects. The Linux daemon provides the public D-Bus API; its GTK application and CLI are clients of that API. The Android companion communicates with the daemon over simultaneous authenticated Wi-Fi / LAN and Bluetooth connections.
 
 | Project | Contents | Build guide |
@@ -46,7 +54,7 @@ There is no mandatory account, external server, telemetry, or root daemon. Unity
 
 Unity now includes [laptop audio routing](Unity_Linux/docs/audio-routing.md), plus [screen sharing and remote device locking in both directions](Unity_Linux/docs/screen-and-lock.md). Update Linux and the Android companion together; phone permissions remain opt-in.
 
-Companion 0.1.8 maintains [Bluetooth and Wi-Fi / LAN together](Unity_Linux/docs/bluetooth.md), routing controls and small updates over Bluetooth and files, photos, audio and screen sharing over Wi-Fi / LAN. Each link reconnects independently with fallback for new work. Linux Media also contains the Phone sound and internet-sharing controls.
+Companion 0.1.8 maintains [Bluetooth and Wi-Fi / LAN together](Unity_Linux/docs/bluetooth.md), routing controls and small updates over Bluetooth and files, photos, audio and screen sharing over Wi-Fi / LAN. Each link reconnects independently with fallback for new work. Phone sound is in Media; phone Mobile Hotspot, Bluetooth devices and internet sharing are in Connectivity.
 
 Companion 0.1.9 and the updated Linux daemon post [native notifications for received files, links and text](Unity_Linux/docs/received-items.md). Click an alert to open that exact item on its destination device.
 
@@ -57,3 +65,17 @@ Companion 0.1.12 provides [call management and SMS reports](Unity_Linux/docs/tel
 Companion 0.1.13 adds [phone control of the shared laptop screen](Unity_Linux/docs/screen-and-lock.md), an Android keyboard toggle, and a laptop-display-off option in both apps. The panel restores when sharing ends or its connection is lost; KDE unattended startup and panel power-off/restoration were checked on the real desktop; phone gestures and end-to-end latency still need physical-device validation.
 
 The KDE desktop update supports [starting directly from the phone](Unity_Linux/docs/screen-and-lock.md#starting-entirely-from-the-phone-on-kde) with companion 0.1.13. Enable the dedicated unattended permission once; screen-off now powers down the laptop panel while a temporary mirror keeps phone control working.
+
+Both apps now support [laptop and phone media players with loop protection](Unity_Linux/docs/media-sync.md), using companion 0.1.15 and the current Linux build.
+
+Companion 0.1.16 and Linux add [independent laptop/phone volume and mute controls](Unity_Linux/docs/device-volume.md) in both Media screens, with quiet external updates and replay protection.
+
+Companion 0.1.17 and Linux fix [laptop audio streaming](Unity_Linux/docs/audio-routing.md) under Wi-Fi delays, packet gaps, and transient phone audio interruptions, with playback error reporting and silent-volume hints.
+
+Companion 0.1.18 and Linux repair Find phone with an audible alarm and synchronized Ring/Stop controls.
+
+Companion **0.1.22** and matching Linux support [audio in either direction](Unity_Linux/docs/audio-routing.md), with Automatic, Wi-Fi stereo and Bluetooth mono choices while keeping both links connected. Phone media capture uses Android's per-session approval.
+
+Companion **0.1.23** and matching Linux add [phone-as-main-display handoff](Unity_Linux/docs/screen-and-lock.md): a temporary virtual monitor becomes primary and the OS disables the laptop panel, with automatic layout restoration. The phone’s computer viewer now supports sensor rotation and an explicit landscape/portrait control.
+
+Companion **0.1.24** and matching Linux add [extended display](Unity_Linux/docs/screen-and-lock.md#phone-as-an-extended-display): use the phone as a separate monitor while continuing to use the laptop display. The existing primary-display handoff remains a separate choice.

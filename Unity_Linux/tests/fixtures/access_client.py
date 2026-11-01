@@ -22,7 +22,8 @@ def call(method, signature='()', args=()):
 
 def snapshot(*_):
     status = json.loads(call('GetAccessStatus'))
-    status.update(pid=os.getpid(), bus_name=bus.get_unique_name(), arguments=sys.argv[1:])
+    status.update(pid=os.getpid(), bus_name=bus.get_unique_name(), arguments=sys.argv[1:],
+                  activation=os.environ.get('XDG_ACTIVATION_TOKEN', ''))
     temporary = state.with_suffix('.tmp')
     temporary.write_text(json.dumps(status))
     temporary.replace(state)

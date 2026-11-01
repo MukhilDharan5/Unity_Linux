@@ -65,6 +65,7 @@ impl Notifications {
         let mut active: HashMap<Key, Active> = HashMap::new();
         let mut seen: HashMap<Key, ([u8; 32], bool, Instant)> = HashMap::new();
         let mut owner = String::new();
+        let mut activation_tokens = HashMap::<u32, String>::new();
         loop {
             tokio::select! {
                 _ = stop.changed() => break,
@@ -113,7 +114,7 @@ impl Notifications {
                     if !alert && !active.contains_key(&key) { continue; }
                     let caps: Vec<String> = match timeout(Duration::from_secs(3),proxy.call("GetCapabilities",&())).await { Ok(Ok(caps)) => caps, _ => continue };
                     let current = dbus.get_name_owner(BUS.try_into()?).await.ok().map(|v| v.to_string()).unwrap_or_default();
-                    if current != owner { active.clear(); owner = current; }
+                    if current != owner { active.clear(); activation_tokens.clear(); owner = current; }
                     if !eligible(&engine,&event.device,&event.feature,Some(&event.generation)).await { continue; }
                     let replace = active.get(&key).map(|v| v.id).unwrap_or(0);
                     if !alert && replace == 0 { continue; }
@@ -134,16 +135,21 @@ impl Notifications {
                 event = signals.next() => {
                     let Some(event) = event else { break };
                     let current = dbus.get_name_owner(BUS.try_into()?).await.ok().map(|v| v.to_string()).unwrap_or_default();
-                    if current != owner { active.clear(); owner = current; }
+                    if current != owner { active.clear(); activation_tokens.clear(); owner = current; }
                     if event.header().sender().is_none_or(|s| s.as_str() != owner) { continue; }
                     match event.header().member().map(|s| s.as_str()) {
-                        Some("NotificationClosed") => { let (id,_): (u32,u32) = event.body().deserialize()?; active.retain(|_,v| v.id != id); }
+                        Some("ActivationToken") => {
+                            let (id,token): (u32,String) = event.body().deserialize()?;
+                            if token.len() <= 4096 && active.values().any(|item| item.id == id) { activation_tokens.insert(id,token); }
+                        }
+                        Some("NotificationClosed") => { let (id,_): (u32,u32) = event.body().deserialize()?; active.retain(|_,v| v.id != id); activation_tokens.remove(&id); }
                         Some("ActionInvoked") => {
                             let (id,action): (u32,String) = event.body().deserialize()?;
                             if matches!(action.as_str(),"default"|"open") {
                                 if let Some((key,item)) = active.iter().find(|(_,v)| v.id == id) {
                                     let view = if item.messages && eligible(&engine,&key.0,"sms",None).await { "--open-messages" } else { "--open-notifications" };
-                                    crate::call_alerts::launch_client(&[view,&key.0]).await;
+                                    let activation = activation_tokens.remove(&id).unwrap_or_default();
+                                    crate::call_alerts::launch_client_with_activation(&[view,&key.0], &activation).await;
                                 }
                             }
                         }
@@ -166,10 +172,11 @@ impl Notifications {
                     let Some(event) = event else { break };
                     if event.args()?.name().as_str() == BUS {
                         let current = dbus.get_name_owner(BUS.try_into()?).await.ok().map(|v| v.to_string()).unwrap_or_default();
-                        if current != owner { active.clear(); owner = current; }
+                        if current != owner { active.clear(); activation_tokens.clear(); owner = current; }
                     }
                 }
             }
+            activation_tokens.retain(|id, _| active.values().any(|item| item.id == *id));
         }
         for item in active.values() {
             close(&proxy, item.id).await;

@@ -177,9 +177,10 @@ class PhoneCallAction : BroadcastReceiver() {
 }
 
 /** The optional Phone role must provide a call screen even offline or with sharing disabled. */
-class PhoneCallActivity : Activity() {
+class PhoneCallActivity : AdwaitaActivity() {
  private lateinit var body: android.widget.LinearLayout
  private var signature = ""
+ private var keypadVisible = false
  private val timers = mutableListOf<Pair<android.widget.TextView, Long>>()
  private val handler = Handler(Looper.getMainLooper())
  private val observer: () -> Unit = { render() }
@@ -193,16 +194,18 @@ class PhoneCallActivity : Activity() {
  }
  override fun onCreate(saved: Bundle?) {
   super.onCreate(saved); setShowWhenLocked(true); setTurnScreenOn(true)
-  val ui = AdwaitaUi(this); body = ui.column().apply { setPadding(ui.dp(20), ui.dp(24), ui.dp(20), ui.dp(24)); setBackgroundColor(ui.window) }
-  setContentView(android.widget.ScrollView(this).apply { addView(body) }); render()
+  keypadVisible = saved?.getBoolean("keypad") ?: false
+  body = contentPage("Phone call"); render()
  }
  override fun onStart() { super.onStart(); CompanionEvents.observe(observer); render(); handler.post(tick) }
  override fun onStop() { CompanionEvents.remove(observer); handler.removeCallbacks(tick); super.onStop() }
- private fun action(title: String, action: String, data: JSONObject = JSONObject()) {
-  body.addView(android.widget.Button(this).apply { text = title; setOnClickListener {
-   runCatching { UnityInCallService.instance?.control(action, data) }.onFailure { android.widget.Toast.makeText(this@PhoneCallActivity, it.message, android.widget.Toast.LENGTH_LONG).show() }
-  } })
+ override fun onSaveInstanceState(out: Bundle) { out.putBoolean("keypad", keypadVisible); super.onSaveInstanceState(out) }
+ private fun control(action: String, data: JSONObject) {
+  runCatching { checkNotNull(UnityInCallService.instance) { "The call has ended" }.control(action, data) }
+   .onFailure { android.widget.Toast.makeText(this, it.message, android.widget.Toast.LENGTH_LONG).show() }
  }
+ private fun action(card: android.widget.LinearLayout, title: String, action: String, data: JSONObject = JSONObject()) =
+  AdwaitaUi(this).action(card, title, suggested = action == "answer", destructive = action in listOf("reject", "hangup")) { control(action, data) }
  private fun render() {
   val service = UnityInCallService.instance
   val state = service?.snapshot() ?: UnityInCallService.emptySnapshot()
@@ -213,26 +216,38 @@ class PhoneCallActivity : Activity() {
   val ui = AdwaitaUi(this)
   for (index in 0 until calls.length()) {
    val call = calls.getJSONObject(index); val id = call.getString("id"); val phase = call.getString("state")
-   body.addView(ui.label(call.getString("name").ifEmpty { call.getString("number").ifEmpty { "Unknown caller" } }, 26f, true))
-   body.addView(ui.label(phase.replace('_', ' '), 16f))
-   if (call.getLong("connect_time") > 0) { val timer = ui.label("00:00", 26f, true); body.addView(timer); timers.add(timer to call.getLong("connect_time")) }
-   if (phase == "ringing") { action("Answer", "answer", JSONObject().put("call_id", id)); action("Decline", "reject", JSONObject().put("call_id", id)) }
+   val card = ui.section(body, if (phase == "ringing") "Incoming call" else "Current call")
+   val identity = ui.column().apply { gravity = android.view.Gravity.CENTER_HORIZONTAL; setPadding(ui.dp(20), ui.dp(24), ui.dp(20), ui.dp(24)) }
+   identity.addView(ui.icon(R.drawable.ic_phone, ui.accentText, 40).apply { background = ui.shape(ui.accentSoft, 40); setPadding(ui.dp(16), ui.dp(16), ui.dp(16), ui.dp(16)) }, android.widget.LinearLayout.LayoutParams(ui.dp(80), ui.dp(80)))
+   identity.addView(ui.label(call.getString("name").ifEmpty { call.getString("number").ifEmpty { "Unknown caller" } }, 26f, true).apply { gravity = android.view.Gravity.CENTER; setPadding(0, ui.dp(20), 0, ui.dp(8)) })
+   if (call.getString("name").isNotBlank()) identity.addView(ui.label(call.getString("number"), 16f, secondary = true).apply { gravity = android.view.Gravity.CENTER })
+   identity.addView(ui.label(phase.replace('_', ' ').replaceFirstChar { it.uppercase() }, 16f, secondary = true).apply { gravity = android.view.Gravity.CENTER; setPadding(0, ui.dp(8), 0, 0) })
+   if (call.getLong("connect_time") > 0 && phase in listOf("active", "held")) {
+    val elapsed = ((System.currentTimeMillis() - call.getLong("connect_time")) / 1000).coerceAtLeast(0)
+    val timer = ui.label("%02d:%02d".format(elapsed / 60, elapsed % 60), 26f, true).apply { gravity = android.view.Gravity.CENTER; setPadding(0, ui.dp(12), 0, 0) }
+    identity.addView(timer); timers.add(timer to call.getLong("connect_time"))
+   }
+   card.addView(identity)
+   if (phase == "ringing") { action(card, "Answer", "answer", JSONObject().put("call_id", id)); action(card, "Decline", "reject", JSONObject().put("call_id", id)) }
    else {
-    action("End call", "hangup", JSONObject().put("call_id", id))
-    if (call.getBoolean("can_hold") && phase in listOf("active", "held")) action(if (phase == "held") "Resume" else "Hold", if (phase == "held") "unhold" else "hold", JSONObject().put("call_id", id))
+    action(card, "End call", "hangup", JSONObject().put("call_id", id))
+    if (call.getBoolean("can_hold") && phase in listOf("active", "held")) action(card, if (phase == "held") "Resume" else "Hold", if (phase == "held") "unhold" else "hold", JSONObject().put("call_id", id))
     if (phase == "active") {
-     val grid = android.widget.GridLayout(this).apply { columnCount = 3 }
-     "123456789*0#".forEach { tone -> grid.addView(android.widget.Button(this).apply { text = tone.toString(); setOnClickListener {
-      runCatching { service?.control("dtmf", JSONObject().put("call_id", id).put("tone", tone.toString())) }.onFailure { android.widget.Toast.makeText(this@PhoneCallActivity, it.message, android.widget.Toast.LENGTH_LONG).show() }
-     } }) }
-     body.addView(grid)
+     ui.action(card, if (keypadVisible) "Hide keypad" else "Keypad") { keypadVisible = !keypadVisible; signature = ""; render() }
+     if (keypadVisible) card.addView(ui.keypad(allowPlus = false) { tone -> control("dtmf", JSONObject().put("call_id", id).put("tone", tone)) }.apply { setPadding(ui.dp(12), ui.dp(8), ui.dp(12), ui.dp(12)) })
     }
    }
   }
-  action(if (state.getBoolean("muted")) "Unmute" else "Mute", "mute", JSONObject().put("muted", !state.getBoolean("muted")))
-  body.addView(ui.label("Audio: ${state.getString("route")}", 18f, true))
+  val audio = ui.section(body, "Call audio")
+  ui.addRow(audio, ui.row("Mute microphone", "Keep listening without sending your voice.", R.drawable.ic_phone,
+   ui.toggle(state.getBoolean("muted"), "Mute microphone") { muted -> control("mute", JSONObject().put("muted", muted)) }).view)
   val routes = state.getJSONArray("routes")
-  for (index in 0 until routes.length()) { val route = routes.getString(index); action(when (route) { "speaker" -> "Phone speakerphone"; "bluetooth" -> "Bluetooth"; "wired" -> "Wired headset"; else -> "Phone earpiece" }, "route", JSONObject().put("route", route)) }
-  if (state.optString("error").isNotEmpty()) body.addView(ui.label(state.getString("error"), 16f))
+  for (index in 0 until routes.length()) {
+   val route = routes.getString(index); val selected = state.getString("route") == route
+   ui.addRow(audio, ui.row(when (route) { "speaker" -> "Phone speakerphone"; "bluetooth" -> "Bluetooth"; "wired" -> "Wired headset"; else -> "Phone earpiece" },
+    if (selected) "In use" else "Tap to use", R.drawable.ic_media, if (selected) ui.icon(R.drawable.ic_check, ui.accentText) else null,
+    action = { control("route", JSONObject().put("route", route)) }).view.apply { isSelected = selected })
+  }
+  if (state.optString("error").isNotEmpty()) ui.addRow(audio, ui.row("Audio unavailable", state.getString("error"), R.drawable.ic_info).view)
  }
 }

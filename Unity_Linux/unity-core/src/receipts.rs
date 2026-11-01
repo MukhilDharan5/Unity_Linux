@@ -12,7 +12,7 @@ use tokio::{
     sync::{mpsc, Mutex},
     time::timeout,
 };
-use zbus::zvariant::{Fd, OwnedObjectPath, Value as Variant};
+use zbus::zvariant::{Fd, OwnedObjectPath, OwnedValue, Value as Variant};
 
 const SERVICE: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
@@ -70,11 +70,13 @@ impl Notifications {
                 body: format!("{device} · {url}"),
                 target: Target::Link(url.into()),
             }),
-            "clipboard" => value["text"].as_str().map(|text| Receipt {
-                title: "Text received".into(),
-                body: format!("{device} · {}", text.chars().take(240).collect::<String>()),
-                target: Target::Text(text.into()),
-            }),
+            "clipboard" if value["automatic"] != true => {
+                value["text"].as_str().map(|text| Receipt {
+                    title: "Text received".into(),
+                    body: format!("{device} · {}", text.chars().take(240).collect::<String>()),
+                    target: Target::Text(text.into()),
+                })
+            }
             _ => None,
         };
         if let Some(receipt) = receipt {
@@ -88,6 +90,7 @@ struct Active {
     target: Target,
     created: Instant,
     activation: String,
+    closed: Option<Instant>,
 }
 async fn run(mut rx: mpsc::Receiver<Receipt>, directory: PathBuf) -> Result<()> {
     let bus = zbus::Connection::session().await?;
@@ -124,22 +127,30 @@ async fn run(mut rx: mpsc::Receiver<Receipt>, directory: PathBuf) -> Result<()> 
                             timeout(Duration::from_secs(1), proxy.call::<_, _, ()>("CloseNotification", &(old,))).await.ok();
                         }
                     }
-                    active.insert(id, Active { target: receipt.target, created: Instant::now(), activation: String::new() });
+                    active.insert(id, Active { target: receipt.target, created: Instant::now(), activation: String::new(), closed: None });
                 }
             },
             event = signals.next() => {
                 let Some(event) = event else { return Ok(()) };
+                let owner = dbus.get_name_owner(SERVICE.try_into()?).await.ok().map(|owner| owner.to_string());
+                if owner != server_owner { active.clear(); server_owner = owner; }
+                if event.header().sender().map(|sender| sender.as_str()) != server_owner.as_deref() { continue; }
                 match event.header().member().map(|member| member.as_str()) {
                     Some("ActionInvoked") => {
                         let (id, action): (u32, String) = event.body().deserialize()?;
-                        let owner = dbus.get_name_owner(SERVICE.try_into()?).await.ok().map(|owner| owner.to_string());
-                        if owner != server_owner { active.clear(); server_owner = owner; }
-                        if event.header().sender().map(|sender| sender.as_str()) != server_owner.as_deref() { continue; }
                         if matches!(action.as_str(), "default" | "open") {
                             if let Some(item) = active.remove(&id) {
+                                // Some desktops close a popup immediately before emitting its action.
+                                if item.closed.is_some_and(|at| at.elapsed() > Duration::from_secs(5)) { continue; }
                                 let bus = bus.clone(); let directory = directory.clone();
                                 tokio::spawn(async move {
-                                    if let Err(error) = open(&bus, &directory, item.target, &item.activation).await { tracing::warn!(%error, "Could not open received item"); }
+                                    if let Err(error) = open(&bus, &directory, item.target, &item.activation).await {
+                                        tracing::warn!(%error, "Could not open received item");
+                                        if let Ok(notifications) = zbus::Proxy::new(&bus, SERVICE, PATH, SERVICE).await {
+                                            let hints = HashMap::from([("desktop-entry", Variant::from("org.unityconnect.Unity"))]);
+                                            timeout(Duration::from_secs(3), notifications.call::<_, _, u32>("Notify", &("Unity", 0u32, "org.unityconnect.Unity", "Could not open received item", "The item is still saved. Install an app that supports this file type, then open it from Unity or Downloads.", Vec::<&str>::new(), hints, 10000i32))).await.ok();
+                                        }
+                                    }
                                 });
                                 timeout(Duration::from_secs(1), proxy.call::<_, _, ()>("CloseNotification", &(id,))).await.ok();
                             }
@@ -147,7 +158,7 @@ async fn run(mut rx: mpsc::Receiver<Receipt>, directory: PathBuf) -> Result<()> 
                     }
                     Some("NotificationClosed") => {
                         let (id, _reason): (u32, u32) = event.body().deserialize()?;
-                        active.remove(&id);
+                        if let Some(item) = active.get_mut(&id) { item.closed = Some(Instant::now()); }
                     }
                     Some("ActivationToken") => {
                         let (id, token): (u32, String) = event.body().deserialize()?;
@@ -191,21 +202,7 @@ async fn open(
         }
         target => target,
     };
-    let mut options = HashMap::from([
-        ("writable", Variant::from(false)),
-        ("ask", Variant::from(false)),
-    ]);
-    if !activation.is_empty() {
-        options.insert("activation_token", Variant::from(activation));
-    }
-    let portal = zbus::Proxy::new(
-        bus,
-        "org.freedesktop.portal.Desktop",
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.OpenURI",
-    )
-    .await?;
-    let (result, fallback) = match target {
+    let (file, fallback) = match target {
         Target::File(path) => {
             use std::os::unix::fs::OpenOptionsExt;
             if path.parent() != Some(directory) {
@@ -218,13 +215,8 @@ async fn open(
             if !file.metadata()?.is_file() || path.parent() != Some(directory) {
                 bail!("Received file is missing or outside received storage")
             }
-            let fd = Fd::from(&file);
             (
-                timeout(
-                    Duration::from_secs(5),
-                    portal.call::<_, _, OwnedObjectPath>("OpenFile", &("", fd, options)),
-                )
-                .await,
+                Some(file),
                 path.to_str()
                     .context("Invalid received filename")?
                     .to_owned(),
@@ -234,19 +226,13 @@ async fn open(
             unity_plugins::plugin("urls")
                 .unwrap()
                 .event(&serde_json::json!({"url":url}))?;
-            (
-                timeout(
-                    Duration::from_secs(5),
-                    portal.call::<_, _, OwnedObjectPath>("OpenURI", &("", &url, options)),
-                )
-                .await,
-                url,
-            )
+            (None, url)
         }
         Target::Text(_) => unreachable!(),
     };
-    if matches!(result, Ok(Ok(_))) {
-        return Ok(());
+    match portal_open(bus, file.as_ref(), &fallback, activation).await {
+        Ok(()) => return Ok(()),
+        Err(error) => tracing::debug!(%error, "Received-item portal failed; trying Gio"),
     }
     // Minimal desktop environments can open through Gio without a portal service.
     let mut command = Command::new("gio");
@@ -259,6 +245,95 @@ async fn open(
         bail!("{}", String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
+}
+
+async fn portal_open(
+    bus: &zbus::Connection,
+    file: Option<&std::fs::File>,
+    target: &str,
+    activation: &str,
+) -> Result<()> {
+    // Subscribe before calling: a portal can emit Response before returning the request path.
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.portal.Desktop")?
+        .interface("org.freedesktop.portal.Request")?
+        .member("Response")?
+        .build();
+    let mut responses = zbus::MessageStream::for_match_rule(rule, bus, Some(32)).await?;
+    let token = format!("unity_received_{}", uuid::Uuid::new_v4().simple());
+    let mut options = HashMap::from([
+        ("writable", Variant::from(false)),
+        ("ask", Variant::from(false)),
+        ("handle_token", Variant::from(token.as_str())),
+    ]);
+    if !activation.is_empty() {
+        options.insert("activation_token", Variant::from(activation));
+    }
+    let portal = zbus::Proxy::new(
+        bus,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.OpenURI",
+    )
+    .await?;
+    let reply = timeout(Duration::from_secs(5), async {
+        match file {
+            Some(file) => {
+                portal
+                    .call_method("OpenFile", &("", Fd::from(file), options))
+                    .await
+            }
+            None => portal.call_method("OpenURI", &("", target, options)).await,
+        }
+    })
+    .await??;
+    let request: OwnedObjectPath = reply.body().deserialize()?;
+    let owner = reply
+        .header()
+        .sender()
+        .context("Portal reply has no sender")?
+        .to_owned();
+    let result = timeout(Duration::from_secs(60), async {
+        while let Some(response) = responses.next().await {
+            let response = response?;
+            let header = response.header();
+            if header.path() != Some(&request.as_ref()) || header.sender() != Some(&owner) {
+                continue;
+            }
+            let (code, _results): (u32, HashMap<String, OwnedValue>) =
+                response.body().deserialize()?;
+            // Cancellation is a completed user choice, never a reason to force another opener.
+            return if code <= 1 {
+                Ok(())
+            } else {
+                bail!("Portal could not open received item ({code})")
+            };
+        }
+        bail!("Portal response stream closed")
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Ok(request) = zbus::Proxy::new(
+                bus,
+                owner.as_str(),
+                request.as_str(),
+                "org.freedesktop.portal.Request",
+            )
+            .await
+            {
+                timeout(
+                    Duration::from_secs(1),
+                    request.call::<_, _, ()>("Close", &()),
+                )
+                .await
+                .ok();
+            }
+            Err(error.into())
+        }
+    }
 }
 #[cfg(test)]
 mod tests {

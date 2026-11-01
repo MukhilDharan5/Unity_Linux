@@ -1129,6 +1129,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
+name = "unity-auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "unity-core"
 version = "0.1.0"
 dependencies = [
@@ -1145,6 +1158,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "unity-auth",
  "unity-plugins",
  "unity-protocol",
  "unity-security",
@@ -1167,6 +1181,16 @@ dependencies = [
  "unity-plugins",
  "unity-protocol",
  "zbus",
+]
+
+[[package]]
+name = "unity-pam"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde_json",
+ "unity-auth",
 ]
 
 [[package]]

@@ -22,7 +22,7 @@ systemctl --user enable --now unityd.service
 
 A GTK-only install or removal does not control the daemon. Remove just the frontend with `scripts/uninstall-gtk.py`. The GTK entry point uses the installed `unityctl launch-gtk` command, which verifies and approves only its own child. Install or update the daemon and CLI component before the GTK client, because the launcher needs the `GetAccessStatus` method and `AccessRequested` signal.
 
-LAN uses TCP 17161 and discovery UDP 17162. Fedora's firewall may block inbound traffic. If needed, explicitly allow those ports in your trusted LAN zone after reviewing your network setup. Unity does not open firewall ports or assume Wi-Fi Direct, hotspot/station concurrency, or automatically configured Classic Bluetooth telephony. Separate HFP call audio setup is described in [telephony](telephony.md). Manual IP entry works when broadcast discovery is blocked.
+LAN uses TLS 1.3 over TCP 17161, plus one free compatibility port in 1714–1764 for the default wildcard listener. The exact listening ports are shown by `unityctl diagnose` and shared over the paired encrypted Bluetooth connection. IPv4 and IPv6 are supported; plaintext UDP discovery is removed. Fedora's firewall may still block inbound traffic. Unity does not open firewall ports or assume Wi-Fi Direct, hotspot/station concurrency, or automatically configured Classic Bluetooth telephony. See [public Wi-Fi](public-wifi.md) and separate [HFP call audio setup](telephony.md).
 
 Credential storage must enforce POSIX ownership and 0700/0600 modes. This source workspace may be on NTFS, but installed binaries and state belong on a Linux filesystem. Do not configure `--state-dir` on a world-writable, FAT, or NTFS mount. Integration tests use isolated temporary directories.
 
@@ -33,3 +33,7 @@ Audio routing additionally requires `pulseaudio-utils` (`pactl`, `parec`) and a 
 Screen sharing additionally needs Python GStreamer introspection, the PipeWire GStreamer plugin, video/JPEG plugins and a ScreenCast-capable desktop portal backend. The daemon install includes `screen-capture.py`; release `dist/` includes it alongside the binaries. Install both daemon and GTK components when updating. See [screen and locking setup](screen-and-lock.md).
 
 For Bluetooth, install the updated companion and follow [Bluetooth setup](bluetooth.md). No LAN firewall port is needed for a Bluetooth connection.
+
+GNOME Wayland setup, clipboard support, notification activation and call prerequisites are described in [GNOME integration](gnome.md).
+
+Media cover decoding requires Python Pillow (`python3-pillow` on Fedora). The helper decodes bounded images directly and works with the daemon's NoNewPrivileges service policy; it does not require a nested image-loader sandbox.

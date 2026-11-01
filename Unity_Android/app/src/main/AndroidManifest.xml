@@ -1,12 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+ <uses-feature android:name="android.hardware.microphone" android:required="false" />
  <uses-feature android:name="android.hardware.telephony" android:required="false" />
  <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
  <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
  <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
  <uses-permission android:name="android.permission.INTERNET" />
+ <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+ <uses-permission android:name="android.permission.RECORD_AUDIO" />
  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+ <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+ <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+ <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
  <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+ <uses-permission android:name="android.permission.WAKE_LOCK" />
  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
@@ -19,30 +26,40 @@
  <uses-permission android:name="android.permission.SEND_SMS" />
  <uses-permission android:name="android.permission.READ_SMS" />
  <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+ <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
  <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
  <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
  <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
- <application android:label="Unity" android:icon="@drawable/ic_unity" android:theme="@style/Theme.Unity" android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true">
+ <queries>
+  <package android:name="moe.shizuku.privileged.api" />
+  <intent><action android:name="android.intent.action.VIEW" /><data android:mimeType="*/*" /></intent>
+ </queries>
+ <application android:label="@string/app_name" android:icon="@drawable/ic_unity" android:theme="@style/Theme.Unity" android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true">
+  <provider android:name="rikka.shizuku.ShizukuProvider" android:authorities="${applicationId}.shizuku" android:enabled="true" android:exported="true" android:multiprocess="false" android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
   <activity android:name=".MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
    <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
    <intent-filter><action android:name="android.intent.action.SEND"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="text/plain"/></intent-filter>
    <intent-filter><action android:name="android.intent.action.SEND"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="*/*"/></intent-filter>
   </activity>
-  <activity android:name=".ReceivedItemActivity" android:exported="false" android:excludeFromRecents="true" />
+  <activity android:name=".ReceivedItemActivity" android:exported="false" android:excludeFromRecents="true" android:launchMode="singleTop" />
+  <activity android:name=".MediaActivity" android:exported="false" />
+  <activity android:name=".PhoneAuthenticationActivity" android:exported="false" android:excludeFromRecents="true" android:launchMode="singleTop" />
+  <activity android:name=".AudioConsentActivity" android:exported="false" />
   <activity android:name=".ScreenConsentActivity" android:exported="false" />
-  <activity android:name=".ScreenViewerActivity" android:exported="false" />
+  <activity android:name=".ScreenViewerActivity" android:exported="false" android:screenOrientation="fullSensor" android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden" />
   <activity android:name=".DialerActivity" android:exported="true">
    <intent-filter><action android:name="android.intent.action.DIAL"/><category android:name="android.intent.category.DEFAULT"/></intent-filter>
    <intent-filter><action android:name="android.intent.action.DIAL"/><category android:name="android.intent.category.DEFAULT"/><data android:scheme="tel"/></intent-filter>
   </activity>
   <activity android:name=".PhoneCallActivity" android:exported="false" android:launchMode="singleTask" android:excludeFromRecents="true" />
   <receiver android:name=".PhoneCallAction" android:exported="false" />
+  <receiver android:name=".LaptopMediaAction" android:exported="false" />
   <service android:name=".UnityInCallService" android:permission="android.permission.BIND_INCALL_SERVICE" android:exported="true">
    <meta-data android:name="android.telecom.IN_CALL_SERVICE_UI" android:value="true" />
    <intent-filter><action android:name="android.telecom.InCallService"/></intent-filter>
   </service>
-  <receiver android:name=".UnityDeviceAdmin" android:permission="android.permission.BIND_DEVICE_ADMIN" android:exported="true" android:label="Unity phone locking">
+  <receiver android:name=".UnityDeviceAdmin" android:permission="android.permission.BIND_DEVICE_ADMIN" android:exported="true" android:label="@string/admin_label">
    <meta-data android:name="android.app.device_admin" android:resource="@xml/device_admin" />
    <intent-filter><action android:name="android.app.action.DEVICE_ADMIN_ENABLED" /></intent-filter>
   </receiver>
@@ -50,11 +67,11 @@
   <service android:name=".PhoneNotifications" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" android:exported="true">
    <intent-filter><action android:name="android.service.notification.NotificationListenerService"/></intent-filter>
   </service>
-  <service android:name=".UnityKeyboard" android:permission="android.permission.BIND_INPUT_METHOD" android:exported="true" android:label="Unity remote keyboard">
+  <service android:name=".UnityKeyboard" android:permission="android.permission.BIND_INPUT_METHOD" android:exported="true" android:label="@string/keyboard_label">
    <intent-filter><action android:name="android.view.InputMethod"/></intent-filter>
    <meta-data android:name="android.view.im" android:resource="@xml/input_method"/>
   </service>
-  <service android:name=".UnityAccessibility" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE" android:exported="true" android:label="Unity remote touch">
+  <service android:name=".UnityAccessibility" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE" android:exported="true" android:label="@string/accessibility_label">
    <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
    <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility"/>
   </service>

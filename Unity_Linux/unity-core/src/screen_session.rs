@@ -55,6 +55,7 @@ pub(super) enum Work {
         done: watch::Sender<bool>,
         control: bool,
         blank_display: bool,
+        extend_display: bool,
     },
     Stop {
         done: Option<watch::Receiver<bool>>,
@@ -133,6 +134,7 @@ pub(super) fn prepare(
         .to_string();
     let control = source == "desktop" && data["control"] != false;
     let blank_display = data["blank_display"] == true;
+    let extend_display = data["extend_display"] == true;
     state.screens.insert(
         device.into(),
         ScreenSession {
@@ -144,7 +146,7 @@ pub(super) fn prepare(
             done: finished,
             source: source.clone(),
             controls: None,
-            metadata: json!({"input_enabled":false,"display_available":false,"display_on":true}),
+            metadata: json!({"input_enabled":false,"display_available":false,"display_on":true,"phone_primary":false,"extended_display":false}),
         },
     );
     state
@@ -165,6 +167,7 @@ pub(super) fn prepare(
         done,
         control,
         blank_display,
+        extend_display,
     })
 }
 pub async fn read_jpeg<R: AsyncRead + Unpin>(reader: &mut R) -> Result<ScreenFrame> {
@@ -282,7 +285,13 @@ impl Engine {
         else {
             return;
         };
-        for key in ["input_enabled", "display_available", "display_on"] {
+        for key in [
+            "input_enabled",
+            "display_available",
+            "display_on",
+            "phone_primary",
+            "extended_display",
+        ] {
             if value[key].is_boolean() {
                 screen.metadata[key] = value[key].clone();
             }
@@ -476,12 +485,13 @@ impl Engine {
                 done,
                 control,
                 blank_display,
+                extend_display,
             } => {
                 self.changed.send(device.clone()).ok();
                 let result = async {
                     if *cancel.borrow() { return Ok(()) }
                     timeout(Duration::from_secs(3), tx.send(Message::Command { id: op.into(), feature: "screen".into(), action: "start".into(),
-                        data: json!({"request_id":op,"token":token,"source":source,"control":control,"blank_display":blank_display,"format":"jpeg","max_edge":1280,"max_pixels":921600,"max_bytes":MAX_BYTES,"fps":15}) })).await??;
+                        data: json!({"request_id":op,"token":token,"source":source,"control":control,"blank_display":blank_display,"extend_display":extend_display,"format":"jpeg","max_edge":1280,"max_pixels":921600,"max_bytes":MAX_BYTES,"fps":15}) })).await??;
                     let mut socket = tokio::select! {
                         result = timeout(Duration::from_secs(120), socket) => result.context("Phone screen connection or consent timed out")??,
                         _ = cancel.changed() => return Ok(()),
@@ -503,7 +513,7 @@ impl Engine {
                             tokio::select! { _ = tokio::time::sleep(Duration::from_millis(60)) => {}, _ = cancel.changed() => return Ok(()) }
                         }
                     } else {
-                        self.send_desktop_screen(op, &device, &mut socket, &mut cancel, tx, control).await
+                        self.send_desktop_screen(op, &device, &mut socket, &mut cancel, tx, (control, blank_display, extend_display)).await
                     }
                 }.await;
                 let error = if let Err(error) = result {
@@ -596,15 +606,23 @@ impl Engine {
         socket: &mut SecureStream,
         cancel: &mut watch::Receiver<bool>,
         tx: &mpsc::Sender<Message>,
-        control: bool,
+        options: (bool, bool, bool),
     ) -> Result<()> {
+        let (control, phone_display, extend_display) = options;
         let mut command = Command::new("/usr/bin/python3");
+        command.envs(crate::desktop::environment().await);
         command
             .arg(capture_path()?)
             .arg("--state-dir")
             .arg(&self.dir);
         if control {
             command.arg("--control");
+        }
+        if phone_display {
+            command.arg("--phone-display");
+        }
+        if extend_display {
+            command.arg("--extended-display");
         }
         let mut child = command
             .stdin(std::process::Stdio::piped())

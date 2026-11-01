@@ -55,6 +55,11 @@ enum Command {
         revoke: bool,
     },
     Diagnose,
+    /// Configure or control the local Firefox extension bridge.
+    Firefox {
+        #[command(subcommand)]
+        command: FirefoxCommand,
+    },
     Send {
         device: String,
         path: String,
@@ -79,6 +84,17 @@ enum Command {
         disable: bool,
     },
 }
+#[derive(Subcommand)]
+enum FirefoxCommand {
+    Status,
+    Enable,
+    Disable,
+    Restore {
+        profile: String,
+        /// Omit to restore the last active page.
+        context: Option<String>,
+    },
+}
 fn print_json(s: &str) {
     if let Ok(v) = serde_json::from_str::<Value>(s) {
         println!(
@@ -97,6 +113,29 @@ async fn main() -> Result<()> {
         .context("Could not connect to the session bus")?;
     let manager = zbus::Proxy::new(&bus, BUS, ROOT, "org.unityconnect.Manager1").await?;
     match a.cmd {
+        Command::Firefox { command } => match command {
+            FirefoxCommand::Status => {
+                let status: String = manager.call("FirefoxStatus", &()).await?;
+                print_json(&status);
+            }
+            FirefoxCommand::Enable | FirefoxCommand::Disable => {
+                manager
+                    .call::<_, _, ()>(
+                        "SetFirefoxEnabled",
+                        &(matches!(command, FirefoxCommand::Enable),),
+                    )
+                    .await?;
+            }
+            FirefoxCommand::Restore { profile, context } => {
+                let id: String = manager
+                    .call(
+                        "RestoreFirefoxContext",
+                        &(profile, context.unwrap_or_default()),
+                    )
+                    .await?;
+                println!("{id}");
+            }
+        },
         Command::LaunchGtk {
             call_popup,
             open_messages,

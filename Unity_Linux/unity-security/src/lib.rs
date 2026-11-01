@@ -95,12 +95,13 @@ impl Identity {
         })
     }
     pub fn server_config(&self) -> Result<Arc<rustls::ServerConfig>> {
-        let mut c = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![CertificateDer::from(self.cert.clone())],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key.clone())),
-            )?;
+        let mut c =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![CertificateDer::from(self.cert.clone())],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key.clone())),
+                )?;
         c.max_early_data_size = 0;
         Ok(Arc::new(c))
     }

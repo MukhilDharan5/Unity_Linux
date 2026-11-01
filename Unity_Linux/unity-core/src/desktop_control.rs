@@ -6,17 +6,26 @@ use tokio::time::timeout;
 use unity_protocol::{Capability, Message};
 
 pub(super) fn capabilities(disabled: &[String]) -> Vec<Capability> {
-    ["lock", "screen"]
-        .iter()
-        .map(|id| {
-            let mut cap = Capability::available(id);
-            if disabled.iter().any(|f| f == id) {
-                cap.status = unity_protocol::Availability::Disabled;
-                cap.reason = "Disabled on the computer".into();
-            }
-            cap
-        })
-        .collect()
+    [
+        "lock",
+        "screen",
+        "desktop_media",
+        "sound",
+        "audio",
+        "media_artwork",
+    ]
+    .iter()
+    .map(|id| {
+        let mut cap = Capability::available(id);
+        if disabled.iter().any(|f| {
+            f == id || matches!(*id, "desktop_media" | "sound" | "media_artwork") && f == "media"
+        }) {
+            cap.status = unity_protocol::Availability::Disabled;
+            cap.reason = "Disabled on the computer".into();
+        }
+        cap
+    })
+    .collect()
 }
 pub(super) async fn lock_desktop() -> Result<()> {
     let bus = zbus::Connection::session().await?;
@@ -57,7 +66,12 @@ impl Engine {
         data: Value,
     ) {
         let result: Result<Value> = async {
-            if !unity_protocol::valid_id(&id) || !matches!(feature.as_str(), "lock" | "screen") {
+            if !unity_protocol::valid_id(&id)
+                || !matches!(
+                    feature.as_str(),
+                    "lock" | "screen" | "desktop_media" | "sound" | "audio"
+                )
+            {
                 bail!("Unsupported desktop request")
             }
             unity_plugins::plugin(&feature)
@@ -69,6 +83,8 @@ impl Engine {
                 let d = state.devices.get(&device).context("unknown device")?;
                 if session.generation(&generation).is_none()
                     || d.disabled.contains(&feature)
+                    || matches!(feature.as_str(), "desktop_media" | "sound")
+                        && d.disabled.iter().any(|f| f == "media")
                     || !d
                         .capabilities
                         .iter()
@@ -77,7 +93,32 @@ impl Engine {
                     bail!("Desktop feature disabled or not authorized for this session")
                 }
             }
-            if feature == "lock" {
+            if feature == "sound" {
+                if data["source"] != "desktop" {
+                    bail!("Phone requests can only control laptop output")
+                }
+                self.sound
+                    .control(
+                        &self,
+                        &device,
+                        &generation,
+                        &action,
+                        &data,
+                        &format!("{device}:{generation}:{id}"),
+                    )
+                    .await
+            } else if feature == "desktop_media" {
+                self.desktop_media
+                    .control(
+                        &self,
+                        &device,
+                        &generation,
+                        &action,
+                        &data,
+                        &format!("{device}:{generation}:{id}"),
+                    )
+                    .await
+            } else if feature == "lock" {
                 lock_desktop().await?;
                 Ok(json!({"state":"locked"}))
             } else if matches!(action.as_str(), "input" | "display") {

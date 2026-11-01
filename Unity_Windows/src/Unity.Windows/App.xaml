@@ -1,0 +1,76 @@
+<Application x:Class="Unity.Windows.App" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Application.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries><XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls"/></ResourceDictionary.MergedDictionaries>
+      <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Light">
+          <SolidColorBrush x:Key="UnityBackground" Color="#EBEBEE"/>
+          <SolidColorBrush x:Key="UnitySidebar" Color="#F5F5F7"/>
+          <SolidColorBrush x:Key="UnityCard" Color="#F0F0F3"/>
+          <SolidColorBrush x:Key="UnityInset" Color="#E3E3E8"/>
+          <SolidColorBrush x:Key="UnityStroke" Color="#D9D9E0"/>
+          <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#F5F5F7"/>
+          <SolidColorBrush x:Key="UnitySecondary" Color="#5C5C5C"/>
+          <SolidColorBrush x:Key="UnityForeground" Color="#1A1A1A"/>
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="Default">
+          <SolidColorBrush x:Key="UnityBackground" Color="#232329"/>
+          <SolidColorBrush x:Key="UnitySidebar" Color="#2B2B31"/>
+          <SolidColorBrush x:Key="UnityCard" Color="#28282E"/>
+          <SolidColorBrush x:Key="UnityInset" Color="#1E1E24"/>
+          <SolidColorBrush x:Key="UnityStroke" Color="#3B3B44"/>
+          <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#2B2B31"/>
+          <SolidColorBrush x:Key="UnitySecondary" Color="#C2C2C2"/>
+          <SolidColorBrush x:Key="UnityForeground" Color="#FFFFFF"/>
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="HighContrast">
+          <SolidColorBrush x:Key="UnityBackground" Color="{ThemeResource SystemColorWindowColor}"/>
+          <SolidColorBrush x:Key="UnitySidebar" Color="{ThemeResource SystemColorWindowColor}"/>
+          <SolidColorBrush x:Key="UnityCard" Color="{ThemeResource SystemColorWindowColor}"/>
+          <SolidColorBrush x:Key="UnityInset" Color="{ThemeResource SystemColorWindowColor}"/>
+          <SolidColorBrush x:Key="UnityStroke" Color="{ThemeResource SystemColorWindowTextColor}"/>
+          <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="{ThemeResource SystemColorWindowColor}"/>
+          <SolidColorBrush x:Key="UnitySecondary" Color="{ThemeResource SystemColorWindowTextColor}"/>
+          <SolidColorBrush x:Key="UnityForeground" Color="{ThemeResource SystemColorWindowTextColor}"/>
+        </ResourceDictionary>
+      </ResourceDictionary.ThemeDictionaries>
+      <CornerRadius x:Key="ControlCornerRadius">8</CornerRadius>
+      <CornerRadius x:Key="OverlayCornerRadius">16</CornerRadius>
+      <CornerRadius x:Key="CheckBoxCornerRadius">4</CornerRadius>
+      <Style TargetType="Button">
+        <Setter Property="CornerRadius" Value="8"/>
+        <Setter Property="MinHeight" Value="40"/>
+        <Setter Property="Padding" Value="20,9"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+      </Style>
+      <Style TargetType="TextBox">
+        <Setter Property="CornerRadius" Value="8"/>
+        <Setter Property="MinHeight" Value="42"/>
+        <Setter Property="Padding" Value="18,9"/>
+      </Style>
+      <Style TargetType="ComboBox">
+        <Setter Property="CornerRadius" Value="8"/>
+        <Setter Property="MinHeight" Value="42"/>
+        <Setter Property="Padding" Value="18,8,14,8"/>
+      </Style>
+      <Style TargetType="ComboBoxItem"><Setter Property="CornerRadius" Value="8"/></Style>
+      <Style TargetType="GridViewItem"><Setter Property="CornerRadius" Value="12"/></Style>
+      <Style TargetType="ContentDialog">
+        <Setter Property="Background" Value="{ThemeResource UnityCard}"/>
+        <Setter Property="CornerRadius" Value="16"/>
+      </Style>
+      <Style TargetType="FlyoutPresenter">
+        <Setter Property="Background" Value="{ThemeResource UnitySidebar}"/>
+        <Setter Property="CornerRadius" Value="16"/>
+      </Style>
+      <Style TargetType="MenuFlyoutPresenter">
+        <Setter Property="Background" Value="{ThemeResource UnitySidebar}"/>
+        <Setter Property="CornerRadius" Value="16"/>
+      </Style>
+      <Style TargetType="ToolTip">
+        <Setter Property="Background" Value="{ThemeResource UnitySidebar}"/>
+        <Setter Property="CornerRadius" Value="8"/>
+      </Style>
+    </ResourceDictionary>
+  </Application.Resources>
+</Application>

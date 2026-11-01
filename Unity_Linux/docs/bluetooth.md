@@ -1,5 +1,7 @@
 # Bluetooth connections
 
+For a router-free Wi-Fi link alongside Bluetooth, use the [phone-hotspot setup](direct-hotspot.md). Companion 0.1.36 and the matching desktop update handle hotspot subnet changes and stale router-side connections.
+
 Companion 0.1.8 and the updated Linux daemon maintain Bluetooth Classic RFCOMM and Wi-Fi / LAN simultaneously. Bluetooth-only connections are also supported. The main stream carries the existing control protocol, battery telemetry, notifications, media controls, clipboard and verified file transfers. Audio and screen sharing use separate RFCOMM profiles with the existing one-use stream tokens. Actual Android permissions and feature toggles still apply.
 
 1. Install the updated Linux daemon and Android APK. Turn on Bluetooth on both devices and pair them in the operating systems’ Bluetooth settings.

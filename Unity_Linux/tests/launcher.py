@@ -34,7 +34,8 @@ class Launcher(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='unity-launcher-test-')
         self.dir = Path(self.temp.name)
         self.prefix = self.dir / 'prefix'
-        subprocess.run(['python3', str(ROOT / 'scripts/install.py'), '--debug', '--prefix', str(self.prefix)], check=True)
+        subprocess.run(['python3', str(ROOT / 'scripts/install.py'), '--debug', '--prefix', str(self.prefix),
+                        '--firefox-manifest-dir', str(self.prefix / 'firefox-hosts')], check=True)
         # A test-only client takes the fixed installed script's place. Production
         # has no fixture flag or caller-controlled script path in its launcher.
         script = self.prefix / 'share/unity/unity.py'
@@ -142,6 +143,28 @@ class Launcher(unittest.TestCase):
             os.kill(opened['pid'],signal.SIGTERM);self.assertEqual(self.launcher.wait(timeout=5),0)
         invalid = subprocess.run([self.prefix / 'bin/unityctl', 'launch-gtk', '--call-popup', '../other'], capture_output=True, text=True)
         self.assertNotEqual(invalid.returncode, 0)
+
+    def test_notification_click_forwards_gnome_activation_to_the_verified_client(self):
+        import integration as h
+        from fake_notifications import FakeNotifications
+        notices = FakeNotifications(); peer = None; client = None
+        try:
+            info = json.loads(self.cli('discover').stdout)
+            peer = h.Peer(self.port, info['fingerprint']); self.cli('pair', h.DEVICE)
+            secret = peer.read()['secret']; peer.close()
+            peer = h.Peer(self.port, info['fingerprint'], secret)
+            peer.event('notifications', {'id': 'gnome', 'app': 'test.chat', 'title': 'Test', 'text': 'Activation test',
+                'actions': [], 'removed': False, 'alert': True, 'timestamp': int(time.time() * 1000)})
+            notice = wait_for(lambda: notices.items[0] if notices.items else None)
+            notices.token(notice['id'], 'gnome-test-activation')
+            notices.action(notice['id'])
+            client = wait_for(lambda: self.status() if self.status().get('approved') else None)
+            self.assertEqual(client['arguments'], ['--open-notifications=' + h.DEVICE])
+            self.assertEqual(client['activation'], 'gnome-test-activation')
+        finally:
+            if peer: peer.close()
+            if client: os.kill(client['pid'], signal.SIGTERM)
+            notices.close()
 
     def test_live_call_automatically_launches_verified_popup_when_app_is_closed(self):
         import integration as h

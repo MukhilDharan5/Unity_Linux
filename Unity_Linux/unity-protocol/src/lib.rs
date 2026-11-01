@@ -41,6 +41,14 @@ impl Capability {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
+    AuthRequest {
+        id: String,
+        challenge: Value,
+    },
+    AuthResponse {
+        id: String,
+        signature: String,
+    },
     ScreenHello {
         version: u32,
         device_id: String,
@@ -64,6 +72,8 @@ pub enum Message {
         device_id: String,
         name: String,
         capabilities: Vec<Capability>,
+        #[serde(default)]
+        network_info: bool,
     },
     Challenge {
         nonce: String,

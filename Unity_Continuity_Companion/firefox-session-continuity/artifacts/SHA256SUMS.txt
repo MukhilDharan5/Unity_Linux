@@ -1,0 +1,2 @@
+faa8f68123466522ba20239902bd679677e0f370e8bacb364dddacccddad70f0  session-continuity-1.1.0-unsigned.xpi
+2153351a7c24e6746a8048dbe3bd91c5f9ce81f3bbb4b28ab56ec508fe8fb49f  session-continuity-1.1.0-source.zip

@@ -1,6 +1,7 @@
 package org.unityconnect.companion
 
 import android.app.*
+import android.bluetooth.BluetoothAdapter
 import android.content.*
 import android.content.pm.ServiceInfo
 import android.net.*
@@ -23,23 +24,67 @@ class CompanionService : Service() {
  private val transfers = ThreadPoolExecutor(1, 1, 0L, TimeUnit.SECONDS, ArrayBlockingQueue(1))
  lateinit var credentials: Credentials
  lateinit var connection: Connection
+ internal lateinit var networkPrivacy: NetworkPrivacy
  lateinit var features: FeatureRegistry
  private val commands = ThreadPoolExecutor(1, 1, 0L, TimeUnit.SECONDS, ArrayBlockingQueue(16))
  private val receiver = object : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
+   if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED && ::connection.isInitialized) {
+    when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+     BluetoothAdapter.STATE_ON -> connection.retry(LinkKind.BLUETOOTH)
+     BluetoothAdapter.STATE_OFF -> connection.retry(LinkKind.BLUETOOTH, invalidate = true)
+    }
+    return
+   }
+   if (intent.action==PhoneConnectivity.HOTSPOT_STATE_CHANGED && ::connection.isInitialized) {
+    connection.networkChanged(); uiChanged(); return
+   }
    if (::features.isInitialized && ::connection.isInitialized && connection.ready) {
     when (intent.action) {
      Intent.ACTION_BATTERY_CHANGED -> features.battery.publish(intent)
      "android.intent.action.PHONE_STATE" -> features.calls.publish(intent)
+     Intent.ACTION_USER_PRESENT, Intent.ACTION_USER_UNLOCKED -> features.clipboard.publish()
     }
    }
   }
  }
+ private var defaultNetwork: Network? = null
  private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+  override fun onAvailable(network: Network) {
+   defaultNetwork = network
+   if (::connection.isInitialized) connection.networkChanged(network)
+   uiChanged()
+  }
   override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+   if (::connection.isInitialized) connection.networkChanged(network)
+   uiChanged()
    if (::features.isInitialized && ::connection.isInitialized && connection.ready) features.network.publish()
   }
-  override fun onLost(network: Network) { if (::features.isInitialized) features.network.publish() }
+  override fun onLost(network: Network) {
+   if (defaultNetwork == network) defaultNetwork = null
+   if (::connection.isInitialized) connection.networkChanged(network,lost=true)
+   uiChanged()
+   if (::features.isInitialized) runCatching { features.network.publish() }
+  }
+  override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+   if (::connection.isInitialized) connection.networkChanged(network)
+  }
+ }
+ private val localNetworkCallback=object : ConnectivityManager.NetworkCallback() {
+  override fun onAvailable(network: Network) { if (::connection.isInitialized) connection.networkChanged(network); uiChanged() }
+  override fun onLost(network: Network) { if (::connection.isInitialized) connection.networkChanged(network,lost=true); uiChanged() }
+  override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+   if (::connection.isInitialized) connection.networkChanged(network); uiChanged()
+  }
+  override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+   if (::connection.isInitialized) connection.networkChanged(network)
+  }
+ }
+ private val hotspotNetworkCallback=object : ConnectivityManager.NetworkCallback() {
+  override fun onAvailable(network: Network) = localNetworkCallback.onAvailable(network)
+  override fun onLost(network: Network) = localNetworkCallback.onLost(network)
+  override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) = localNetworkCallback.onCapabilitiesChanged(network,capabilities)
+  override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = localNetworkCallback.onLinkPropertiesChanged(network,linkProperties)
  }
  override fun onCreate() {
   super.onCreate(); instance = this
@@ -47,14 +92,26 @@ class CompanionService : Service() {
   nm.createNotificationChannel(NotificationChannel("unity.connection", "Device connection", NotificationManager.IMPORTANCE_LOW))
   nm.createNotificationChannel(NotificationChannel("unity.actions", "Phone actions", NotificationManager.IMPORTANCE_DEFAULT))
   ReceivedItems.channel(this)
+  networkPrivacy = NetworkPrivacy(this)
   credentials = Credentials(this); features = FeatureRegistry(this); connection = Connection(this)
-  val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED).apply { addAction("android.intent.action.PHONE_STATE") }
+  val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED).apply {
+   addAction("android.intent.action.PHONE_STATE"); addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+   addAction(Intent.ACTION_USER_PRESENT); addAction(Intent.ACTION_USER_UNLOCKED)
+   addAction(PhoneConnectivity.HOTSPOT_STATE_CHANGED)
+  }
   if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, RECEIVER_EXPORTED) else registerReceiver(receiver, filter)
   getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(networkCallback)
+  getSystemService(ConnectivityManager::class.java).registerNetworkCallback(NetworkRequest.Builder()
+   .addTransportType(NetworkCapabilities.TRANSPORT_WIFI).addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET).build(),localNetworkCallback)
+  if (Build.VERSION.SDK_INT>=35) getSystemService(ConnectivityManager::class.java).registerNetworkCallback(NetworkRequest.Builder()
+   .addCapability(NetworkCapabilities.NET_CAPABILITY_LOCAL_NETWORK).build(),hotspotNetworkCallback)
  }
  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
   if (intent?.action == "stop") { stopSelf(); return START_NOT_STICKY }
+  if (intent?.action == "stop_audio") { features.audio.stopRemote(); return START_STICKY }
+  if (intent?.action == "stop_find") { features.find.stop(); return START_STICKY }
   startForeground(1, notification(uiState.title), foregroundTypes())
+  PhoneNotifications.ensureConnected(this)
   if (intent?.action != "refresh") status("Connecting to your saved computer…", ConnectionPhase.CONNECTING)
   if (intent?.action == "refresh") features.publish() else if (intent != null) { connection.stop(); connection = Connection(this); connection.start() }
   // START_STICKY restores saved settings after process termination, subject to Android OEM limits.
@@ -64,14 +121,15 @@ class CompanionService : Service() {
  private fun notification(text: String): Notification {
   val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
   return Notification.Builder(this, "unity.connection").setSmallIcon(R.drawable.ic_unity_symbolic)
-   .setContentTitle("Unity").setContentText(text).setContentIntent(open).setOngoing(true).build()
+   .setContentTitle(getString(R.string.app_name)).setContentText(text).setContentIntent(open).setOngoing(true).build()
  }
  fun uiChanged() { CompanionEvents.changed() }
  private fun foregroundTypes() = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
   (if (features.audio.active()) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK else 0) or
-  (if (features.screen.projectionForeground) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0)
+  (if (features.screen.projectionForeground || features.audio.projectionForeground) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0)
  fun refreshForeground() {
   val update = Runnable { if (instance === this) startForeground(1, notification(when {
+   features.audio.projectionForeground -> "Sending phone audio to computer"
    features.screen.projectionForeground -> "Sharing phone screen"
    features.audio.active() -> "Playing laptop audio"
    else -> uiState.title
@@ -121,6 +179,7 @@ class CompanionService : Service() {
   }
   // File chunks must remain strictly ordered; their bounded writes are handled by the reader.
   if (message.optString("feature") == "files") run.run()
+  else if (message.optString("feature") == "clipboard") Handler(Looper.getMainLooper()).post(run)
   else try { commands.execute(run) } catch (_: Exception) { result(id, false, error = "Phone command queue full") }
  }
  fun prompt(title: String, action: String) {
@@ -132,9 +191,11 @@ class CompanionService : Service() {
  }
  override fun onBind(intent: Intent?) = null
  override fun onDestroy() {
-  instance = null; connection.stop(); features.disconnected(); features.media.close(); features.sms.close(); commands.shutdownNow(); transfers.shutdownNow()
+  instance = null; connection.stop(); features.disconnected(); features.clipboard.close(); features.media.close(); features.desktopMedia.close(); features.sms.close(); commands.shutdownNow(); transfers.shutdownNow()
   uiState = ConnectionState.disconnected; uiChanged()
   unregisterReceiver(receiver); getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback)
+  getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(localNetworkCallback)
+  if (Build.VERSION.SDK_INT>=35) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(hotspotNetworkCallback)
   super.onDestroy()
  }
 }

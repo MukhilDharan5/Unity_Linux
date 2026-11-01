@@ -14,6 +14,9 @@ def run(jpeg, directory):
     log = directory / 'screen-input.jsonl'
     stop = threading.Event()
     controlled = '--control' in sys.argv
+    phone_display = '--phone-display' in sys.argv
+    extended_display = '--extended-display' in sys.argv
+    (directory / 'screen-options.json').write_text(json.dumps({'control':controlled,'phone_display':phone_display,'extended_display':extended_display}))
     lock = threading.Lock()
     panel.write_text('72')
 
@@ -22,7 +25,7 @@ def run(jpeg, directory):
             print(json.dumps(value), file=sys.stderr, flush=True)
 
     def state():
-        report({'type': 'state', 'input_enabled': controlled, 'display_available': controlled, 'display_on': panel.read_text() != '0', 'display_error': ''})
+        report({'type': 'state', 'input_enabled': controlled, 'display_available': controlled and not extended_display, 'extended_display':extended_display, 'display_on': panel.read_text() != '0', 'phone_primary':phone_display and panel.read_text() == '0', 'display_error': ''})
 
     def commands():
         try:

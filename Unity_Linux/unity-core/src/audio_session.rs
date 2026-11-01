@@ -1,10 +1,10 @@
 //! A separate, session-bound TLS stream keeps transfers out of the audio path.
-use super::{audio, Engine, State};
+use super::{audio, Engine, Session, State};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::{mpsc, oneshot, watch},
     time::timeout,
 };
@@ -18,15 +18,20 @@ pub(super) struct AudioSession {
     socket: Option<oneshot::Sender<SecureStream>>,
     pub stop: watch::Sender<bool>,
     done: watch::Receiver<Option<String>>,
+    phone_error: watch::Sender<Option<String>>,
     pub operation: String,
 }
 pub(super) enum Work {
     Start {
         device: String,
         token: String,
+        source: String,
+        transport: String,
+        format: audio::Format,
         socket: oneshot::Receiver<SecureStream>,
         cancel: watch::Receiver<bool>,
         done: watch::Sender<Option<String>>,
+        phone_error: watch::Receiver<Option<String>>,
     },
     Stop {
         done: Option<watch::Receiver<Option<String>>>,
@@ -49,10 +54,36 @@ pub(super) fn cancel_generation(state: &mut State, device: &str, generation: &st
         }
     }
 }
+pub(super) fn select_session<'a>(
+    state: &'a State,
+    device: &str,
+    data: &Value,
+) -> Result<&'a Session> {
+    let links = state.sessions.get(device).context("device disconnected")?;
+    let kind = match data["transport"].as_str().unwrap_or("auto") {
+        "lan" => Some(unity_transport::Kind::Lan),
+        "bluetooth" => Some(unity_transport::Kind::Bluetooth),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        links
+            .0
+            .iter()
+            .find(|s| s.kind == kind && !*s.stop.borrow())
+            .context(
+                "Selected audio connection is unavailable; connect it or choose another transport",
+            )
+    } else {
+        links
+            .select(unity_transport::Workload::Bulk)
+            .context("device disconnected")
+    }
+}
 pub(super) fn prepare(
     state: &mut State,
     device: &str,
     action: &str,
+    data: &Value,
     operation: &str,
 ) -> Result<Work> {
     if action == "stop" {
@@ -69,17 +100,21 @@ pub(super) fn prepare(
     if state.audio.is_some() {
         bail!("Laptop audio is already being routed; stop it before selecting another phone")
     }
-    let generation = state
-        .sessions
-        .get(device)
-        .and_then(|links| links.select(unity_transport::Workload::Bulk))
-        .context("device disconnected")?
-        .generation
-        .clone();
+    let session = select_session(state, device, data)?;
+    let generation = session.generation.clone();
+    let transport = if session.kind == unity_transport::Kind::Bluetooth {
+        "bluetooth"
+    } else {
+        "lan"
+    }
+    .to_string();
+    let format = audio::Format::for_bluetooth(session.kind == unity_transport::Kind::Bluetooth);
+    let source = data["source"].as_str().unwrap_or("desktop").to_string();
     let token = hex::encode(unity_security::random_bytes());
     let (tx, socket) = oneshot::channel();
     let (stop, cancel) = watch::channel(false);
     let (done, finished) = watch::channel(None);
+    let (phone_failed, phone_error) = watch::channel(None);
     state.audio = Some(AudioSession {
         device: device.into(),
         generation,
@@ -87,6 +122,7 @@ pub(super) fn prepare(
         socket: Some(tx),
         stop,
         done: finished,
+        phone_error: phone_failed,
         operation: operation.into(),
     });
     state
@@ -94,13 +130,20 @@ pub(super) fn prepare(
         .get_mut(device)
         .context("unknown device")?
         .state
-        .insert("audio".into(), json!({"state":"starting"}));
+        .insert(
+            "audio".into(),
+            json!({"state":"starting","operation":operation,"source":source,"transport":transport}),
+        );
     Ok(Work::Start {
         device: device.into(),
         token,
+        source,
+        transport,
+        format,
         socket,
         cancel,
         done,
+        phone_error,
     })
 }
 async fn wait_done(done: &mut watch::Receiver<Option<String>>) -> Result<()> {
@@ -113,6 +156,47 @@ async fn wait_done(done: &mut watch::Receiver<Option<String>>) -> Result<()> {
     Ok(())
 }
 impl Engine {
+    pub(super) async fn phone_audio_failed(
+        &self,
+        device: &str,
+        generation: &str,
+        operation: &str,
+        error: &str,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        let error = if error.is_empty() {
+            "Phone audio playback stopped"
+        } else {
+            error
+        };
+        if let Some(audio) = state.audio.as_ref().filter(|audio| {
+            audio.device == device && audio.generation == generation && audio.operation == operation
+        }) {
+            audio.phone_error.send(Some(error.into())).ok();
+            audio.stop.send(true).ok();
+            return true;
+        }
+        // A socket close can arrive before the control-link error. Preserve
+        // that useful error after cleanup, without touching a newer stream.
+        let matches = state.operations.get(operation).is_some_and(|op| {
+            op.device == device && op.generation == generation && op.feature == "audio"
+        });
+        if matches {
+            if let Some(audio) = state
+                .devices
+                .get_mut(device)
+                .and_then(|d| d.state.get_mut("audio"))
+            {
+                if audio["operation"] == operation && audio["state"] == "failed" {
+                    audio["error"] = json!(error);
+                    drop(state);
+                    self.changed.send(device.into()).ok();
+                    return true;
+                }
+            }
+        }
+        false
+    }
     pub async fn shutdown_audio(&self) {
         let done = {
             let state = self.state.lock().await;
@@ -162,8 +246,10 @@ impl Engine {
         {
             bail!("Audio stream is not authorized for this session")
         }
-        // Bound queued audio on both TCP and RFCOMM sockets.
-        let bytes: libc::c_int = 4096;
+        // A two-packet send buffer cannot sustain 48 kHz PCM when a phone's
+        // Wi-Fi power saving delays ACKs. Keep it bounded, with enough room
+        // for a short radio sleep; capture still retains only its latest packet.
+        let bytes: libc::c_int = 32 * 1024;
         let result = unsafe {
             libc::setsockopt(
                 socket.get_ref().0.as_raw_fd(),
@@ -211,36 +297,46 @@ impl Engine {
             Work::Start {
                 device,
                 token,
+                source,
+                transport,
+                format,
                 socket,
                 mut cancel,
                 done,
+                phone_error,
             } => {
                 self.changed.send(device.clone()).ok();
                 let result = async {
                     if *cancel.borrow() { return Ok(()) }
                     timeout(Duration::from_secs(3), tx.send(Message::Command {
                         id: op.into(), feature: "audio".into(), action: "start".into(),
-                        data: json!({"token":token,"request_id":op,"rate":audio::RATE,"channels":audio::CHANNELS,
-                            "frames":audio::FRAMES,"format":"s16le"}),
+                        data: json!({"token":token,"request_id":op,"rate":format.rate,"channels":format.channels,
+                            "frames":format.frames,"format":"s16le","source":source,"transport":transport}),
                     })).await??;
                     let mut socket = tokio::select! {
-                        result = timeout(Duration::from_secs(10), socket) => result.context("Phone audio connection timed out")??,
+                        result = timeout(Duration::from_secs(if source == "phone" { 120 } else { 15 }), socket) => result.context("Phone audio connection timed out")??,
                         _ = cancel.changed() => return Ok(()),
                     };
                     if *cancel.borrow() { return Ok(()) }
-                    let mut capture = audio::Capture::open(&self.dir).await?;
+                    if source == "phone" {
+                        return self.receive_audio(op, &device, &mut socket, format, &mut cancel).await;
+                    }
+                    let mut capture = audio::Capture::open(&self.dir, format).await?;
                     let streaming = self.stream_audio(op, &device, &mut socket, &mut capture, &mut cancel).await;
                     drop(socket);
                     let restored = capture.restore().await;
                     streaming.and(restored)
                 }.await;
-                let error = result.err().map(|e| e.to_string()).unwrap_or_default();
+                let error = phone_error
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| result.err().map(|e| e.to_string()).unwrap_or_default());
                 // Also closes a phone receiver that is still connecting or awaiting Ready.
                 tx.try_send(Message::Command {
                     id: uuid::Uuid::new_v4().simple().to_string(),
                     feature: "audio".into(),
                     action: "stop".into(),
-                    data: json!({}),
+                    data: json!({"request_id":op}),
                 })
                 .ok();
                 let mut state = self.state.lock().await;
@@ -258,7 +354,7 @@ impl Engine {
                                         && c.status == unity_protocol::Availability::Available
                                 })
                         }) {
-                            d.state.insert("audio".into(), json!({"state":if error.is_empty() {"stopped"} else {"failed"},"error":error}));
+                            d.state.insert("audio".into(), json!({"state":if error.is_empty() {"stopped"} else {"failed"},"error":error,"operation":op,"source":source,"transport":transport}));
                         }
                     }
                 }
@@ -270,13 +366,13 @@ impl Engine {
                 if pending {
                     self.finish(
                         op,
-                        false,
-                        Value::Null,
+                        error.is_empty(),
                         if error.is_empty() {
-                            "Audio routing stopped before playback".into()
+                            json!({"state":"stopped"})
                         } else {
-                            error.clone()
+                            Value::Null
                         },
+                        error.clone(),
                     )
                     .await;
                 }
@@ -284,6 +380,60 @@ impl Engine {
                 done.send(Some(error)).ok();
             }
         }
+    }
+    async fn receive_audio(
+        &self,
+        op: &str,
+        device: &str,
+        socket: &mut SecureStream,
+        format: audio::Format,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        let mut playback = audio::Playback::open(format)?;
+        let result = async {
+            unity_transport::write_frame(socket, &Message::Ready).await?;
+            let mut previous = None;
+            loop {
+                if *cancel.borrow() {
+                    return Ok(());
+                }
+                let mut packet = vec![0; 8 + format.pcm_bytes()];
+                tokio::select! {
+                    _ = cancel.changed() => return Ok(()),
+                    result = timeout(Duration::from_secs(5), socket.read_exact(&mut packet)) => {
+                        result.context("Phone audio capture stopped")??;
+                    }
+                }
+                let sequence = u64::from_be_bytes(packet[..8].try_into().unwrap());
+                if sequence > i64::MAX as u64 || previous.is_some_and(|p| sequence <= p) {
+                    bail!("Invalid phone audio packet sequence")
+                }
+                tokio::select! {
+                    _ = cancel.changed() => return Ok(()),
+                    result = playback.write(&packet[8..]) => result?,
+                }
+                if previous.is_none() {
+                    self.finish(op, true, json!({"state":"streaming"}), String::new())
+                        .await;
+                    if let Some(audio) = self
+                        .state
+                        .lock()
+                        .await
+                        .devices
+                        .get_mut(device)
+                        .and_then(|d| d.state.get_mut("audio"))
+                        .filter(|a| a["operation"] == op)
+                    {
+                        audio["state"] = json!("streaming");
+                    }
+                    self.changed.send(device.into()).ok();
+                }
+                previous = Some(sequence);
+            }
+        }
+        .await;
+        playback.close().await;
+        result
     }
     async fn stream_audio(
         &self,
@@ -302,7 +452,7 @@ impl Engine {
             timeout(Duration::from_secs(3), unity_transport::write_frame(socket, &Message::Ready)).await??;
             self.finish(op, true, json!({"state":"streaming"}), String::new()).await;
             if let Some(d) = self.state.lock().await.devices.get_mut(device) {
-                d.state.insert("audio".into(), json!({"state":"streaming"}));
+                if let Some(audio) = d.state.get_mut("audio").filter(|a| a["operation"] == op) { audio["state"] = json!("streaming"); }
             }
             self.changed.send(device.into()).ok();
             loop {
@@ -310,7 +460,7 @@ impl Engine {
                 let packet = packets.borrow_and_update().clone().context("missing PCM packet")?;
                 tokio::select! {
                     _ = cancel.changed() => return Ok(()),
-                    result = timeout(Duration::from_millis(100), async {
+                    result = timeout(Duration::from_secs(1), async {
                         socket.write_all(&packet).await?;
                         socket.flush().await
                     }) => result.context("Audio network stalled; routing stopped to avoid delayed playback")??,

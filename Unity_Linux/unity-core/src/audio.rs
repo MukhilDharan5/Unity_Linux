@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     sync::watch,
     time::timeout,
@@ -12,10 +12,80 @@ use tokio::{
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: u32 = 2;
 pub const FRAMES: u32 = 480;
-pub const PCM_BYTES: usize = (FRAMES * CHANNELS * 2) as usize;
-pub const PACKET_BYTES: usize = 8 + PCM_BYTES;
 type PacketReceiver = watch::Receiver<Option<Vec<u8>>>;
 type CaptureTask = tokio::task::JoinHandle<Result<()>>;
+
+/// LAN preserves stereo music; RFCOMM uses bounded 256 kb/s mono PCM.
+#[derive(Clone, Copy)]
+pub struct Format {
+    pub rate: u32,
+    pub channels: u32,
+    pub frames: u32,
+}
+impl Format {
+    pub fn for_bluetooth(bluetooth: bool) -> Self {
+        if bluetooth {
+            Self {
+                rate: 16000,
+                channels: 1,
+                frames: 160,
+            }
+        } else {
+            Self {
+                rate: RATE,
+                channels: CHANNELS,
+                frames: FRAMES,
+            }
+        }
+    }
+    pub fn pcm_bytes(self) -> usize {
+        (self.frames * self.channels * 2) as usize
+    }
+}
+
+/// Playback uses the current laptop output without changing its default device.
+pub struct Playback {
+    child: Child,
+}
+impl Playback {
+    pub fn open(format: Format) -> Result<Self> {
+        let child = Command::new("pacat")
+            .args([
+                "--playback",
+                "--raw",
+                "--format=s16le",
+                &format!("--rate={}", format.rate),
+                &format!("--channels={}", format.channels),
+                "--latency-msec=40",
+                "--process-time-msec=10",
+                "--stream-name=Unity Phone audio",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Install pulseaudio-utils (pacat) for phone audio")?;
+        Ok(Self { child })
+    }
+    pub async fn write(&mut self, pcm: &[u8]) -> Result<()> {
+        timeout(
+            Duration::from_secs(1),
+            self.child
+                .stdin
+                .as_mut()
+                .context("Laptop audio output closed")?
+                .write_all(pcm),
+        )
+        .await
+        .context("Laptop audio output stalled")??;
+        Ok(())
+    }
+    pub async fn close(&mut self) {
+        self.child.kill().await.ok();
+        self.child.wait().await.ok();
+    }
+}
 
 async fn pactl(args: &[&str]) -> Result<String> {
     let output = timeout(
@@ -64,6 +134,7 @@ pub struct Capture {
     saved: SavedRoute,
     journal: PathBuf,
     child: Option<Child>,
+    format: Format,
 }
 impl Capture {
     pub async fn recover(dir: &std::path::Path) -> Result<()> {
@@ -74,13 +145,14 @@ impl Capture {
                 saved,
                 journal,
                 child: None,
+                format: Format::for_bluetooth(false),
             }
             .restore()
             .await?;
         }
         Ok(())
     }
-    pub async fn open(dir: &std::path::Path) -> Result<Self> {
+    pub async fn open(dir: &std::path::Path, format: Format) -> Result<Self> {
         Self::recover(dir).await?;
         let previous = pactl(&["get-default-sink"])
             .await
@@ -111,6 +183,7 @@ impl Capture {
             },
             journal: dir.join("audio-route.json"),
             child: None,
+            format,
         };
         // Journal before changing the desktop output, for recovery after a crash.
         let result = async {
@@ -120,8 +193,8 @@ impl Capture {
                     .args([
                         "--raw",
                         "--format=s16le",
-                        "--rate=48000",
-                        "--channels=2",
+                        &format!("--rate={}", format.rate),
+                        &format!("--channels={}", format.channels),
                         "--latency-msec=10",
                         "--process-time-msec=5",
                         &format!("--device={}.monitor", capture.saved.sink),
@@ -162,10 +235,11 @@ impl Capture {
             .take()
             .context("missing capture output")?;
         let (tx, rx) = watch::channel(None);
+        let packet_bytes = 8 + self.format.pcm_bytes();
         let task = tokio::spawn(async move {
             let mut sequence = 0u64;
             loop {
-                let mut packet = vec![0u8; PACKET_BYTES];
+                let mut packet = vec![0u8; packet_bytes];
                 packet[..8].copy_from_slice(&sequence.to_be_bytes());
                 timeout(Duration::from_secs(3), source.read_exact(&mut packet[8..]))
                     .await

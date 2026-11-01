@@ -9,6 +9,7 @@ pub mod call_control;
 pub mod call_notifications;
 pub mod clipboard;
 pub mod connectivity;
+pub mod desktop_media;
 pub mod files;
 pub mod find;
 pub mod hotspot;
@@ -18,13 +19,16 @@ pub mod network;
 pub mod notification_actions;
 pub mod notifications;
 pub mod pairing;
+pub mod phone_connectivity;
 pub mod photos;
 pub mod previews;
 pub mod reconnect;
 pub mod remote_input;
 pub mod ringer;
+pub mod samsung_routines;
 pub mod screen;
 pub mod sms;
+pub mod sound;
 pub mod urls;
 
 pub mod transfer;
@@ -60,6 +64,9 @@ pub fn registry() -> Vec<Box<dyn Plugin>> {
         Box::new(urls::Feature),
         Box::new(browsing::Feature),
         Box::new(media::Feature),
+        Box::new(sound::Feature),
+        Box::new(desktop_media::Feature),
+        Box::new(previews::MediaArtworkFeature),
         Box::new(audio::Feature),
         Box::new(lock::Feature),
         Box::new(ringer::Feature),
@@ -67,6 +74,8 @@ pub fn registry() -> Vec<Box<dyn Plugin>> {
         Box::new(remote_input::Feature),
         Box::new(screen::Feature),
         Box::new(hotspot::Feature),
+        Box::new(samsung_routines::Feature),
+        Box::new(phone_connectivity::Feature),
     ]
 }
 pub fn plugin(id: &str) -> Option<Box<dyn Plugin>> {
@@ -167,7 +176,42 @@ pub fn validate_command(s: Spec, a: &str, v: &Value) -> Result<()> {
         ("notifications", "dismiss") => {
             text(v, "id", 512)?;
         }
-        ("media", "seek") => bounded(v, "position", 0.0, 86400000.0)?,
+        ("sound", _) => {
+            let source = text(v, "source", 16)?;
+            if !matches!(source, "phone" | "desktop") {
+                bail!("invalid sound target")
+            }
+            if a != "refresh"
+                && source == "desktop"
+                && !v["output"].as_str().is_some_and(unity_protocol::valid_id)
+            {
+                bail!("invalid output identity")
+            }
+            if a == "volume" && !v["volume"].as_u64().is_some_and(|n| n <= 100) {
+                bail!("volume must be an integer from 0 to 100")
+            }
+            if a == "mute" && !v["muted"].is_boolean() {
+                bail!("invalid mute state")
+            }
+        }
+        ("media" | "desktop_media", _) => {
+            if let Some(session) = v.get("session") {
+                if !session.as_str().is_some_and(unity_protocol::valid_id) {
+                    bail!("invalid media session")
+                }
+            }
+            if s.id == "desktop_media" && a != "refresh" {
+                text(v, "session", 32)?;
+            }
+            if a == "seek" {
+                if !v["position"].as_u64().is_some_and(|p| p <= 86400000) {
+                    bail!("invalid seek position")
+                }
+                if s.id == "desktop_media" {
+                    text(v, "track_id", 1024)?;
+                }
+            }
+        }
         ("ringer", "set") => {
             if !["normal", "vibrate", "silent", "dnd", "off"].contains(&text(v, "mode", 32)?) {
                 bail!("invalid ringer mode")
@@ -188,7 +232,7 @@ pub fn validate_command(s: Spec, a: &str, v: &Value) -> Result<()> {
         ("files", "send") => {
             text(v, "path", 4096)?;
         }
-        ("photos", "get") | ("browsing", "get") => {
+        ("photos", "get" | "copy") | ("browsing", "get") => {
             text(v, "id", 2048)?;
         }
         ("photos", "preview") => {
@@ -255,11 +299,67 @@ pub fn validate_event(id: &str, v: &Value) -> Result<()> {
                 bail!("only http(s) URLs are supported")
             }
         }
+        "sound" => {
+            if v["origin"] != "phone"
+                || !v["available"].is_boolean()
+                || !v["muted"].is_boolean()
+                || !v["volume"].as_u64().is_some_and(|n| n <= 100)
+            {
+                bail!("invalid phone volume state")
+            }
+            text(v, "name", 512)?;
+            text(v, "error", 512)?;
+        }
         "media" => {
+            if v["kind"] == "artwork" {
+                return previews::validate_media_update(v);
+            }
+            if let Some(origin) = v.get("origin") {
+                if origin != "phone" {
+                    bail!("media is not phone-native")
+                }
+            }
+            if let Some(players) = v.get("players") {
+                let players = players
+                    .as_array()
+                    .filter(|p| p.len() <= 16)
+                    .ok_or_else(|| anyhow::anyhow!("invalid media players"))?;
+                let mut ids = std::collections::HashSet::new();
+                for player in players {
+                    if player["origin"] != "phone"
+                        || !player["session"]
+                            .as_str()
+                            .is_some_and(unity_protocol::valid_id)
+                        || player.get("players").is_some()
+                        || !ids.insert(player["session"].as_str().unwrap())
+                    {
+                        bail!("invalid player origin or session")
+                    }
+                    validate_event("media", player)?;
+                }
+            }
             text(v, "title", 512)?;
             text(v, "artist", 512)?;
             if !v["playing"].is_boolean() {
                 bail!("missing playback state")
+            }
+            if let Some(active) = v.get("active") {
+                if !active.is_boolean() {
+                    bail!("invalid active media flag")
+                }
+            }
+            if let Some(actions) = v.get("actions") {
+                let actions = actions
+                    .as_array()
+                    .filter(|a| a.len() <= 5)
+                    .ok_or_else(|| anyhow::anyhow!("invalid media actions"))?;
+                if actions.iter().any(|a| {
+                    !a.as_str().is_some_and(|a| {
+                        matches!(a, "play" | "pause" | "next" | "previous" | "seek")
+                    })
+                }) {
+                    bail!("invalid media action")
+                }
             }
             for field in ["album", "app_name", "package"] {
                 if v.get(field).is_some() {
@@ -272,7 +372,7 @@ pub fn validate_event(id: &str, v: &Value) -> Result<()> {
                 }
             }
             if let Some(image) = v.get("artwork").filter(|image| !image.is_null()) {
-                previews::validate(image)?;
+                previews::validate_media(image)?;
             }
         }
         "call_notifications" => {
@@ -281,6 +381,11 @@ pub fn validate_event(id: &str, v: &Value) -> Result<()> {
         }
         "ringer" => {
             text(v, "mode", 32)?;
+        }
+        "find" => {
+            if !["ringing", "stopped"].contains(&text(v, "state", 32)?) {
+                bail!("invalid find state")
+            }
         }
         "files" => {
             text(v, "phase", 16)?;
@@ -336,12 +441,58 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn find_state_accepts_only_ringing_and_stopped() {
+        for state in ["ringing", "stopped"] {
+            validate_event("find", &json!({"state":state})).unwrap();
+        }
+        for data in [json!({}), json!({"state":123}), json!({"state":"playing"})] {
+            assert!(validate_event("find", &data).is_err());
+        }
+    }
+    #[test]
     fn all_requirements_have_modules() {
-        assert_eq!(registry().len(), 23);
+        assert_eq!(registry().len(), 28);
         let mut ids = std::collections::HashSet::new();
         for p in registry() {
             assert!(ids.insert(p.spec().id));
         }
+    }
+    #[test]
+    fn media_sources_and_controls_have_bounded_native_sessions() {
+        let player = json!({"origin":"phone","session":"ab".repeat(16),"title":"Track","artist":"Artist","playing":false,"active":true,"actions":["play","next"]});
+        let mut snapshot = player.clone();
+        snapshot["players"] = json!([player]);
+        assert!(plugin("media").unwrap().event(&snapshot).is_ok());
+        for malformed in [
+            json!([snapshot.clone()]),
+            json!([
+                snapshot["players"][0].clone(),
+                snapshot["players"][0].clone()
+            ]),
+        ] {
+            let mut invalid = snapshot.clone();
+            invalid["players"] = malformed;
+            assert!(plugin("media").unwrap().event(&invalid).is_err());
+        }
+        snapshot["players"][0]["origin"] = json!("desktop");
+        assert!(plugin("media").unwrap().event(&snapshot).is_err());
+        let plugin = plugin("desktop_media").unwrap();
+        assert!(plugin
+            .command("next", &json!({"session":"ab".repeat(16)}))
+            .is_ok());
+        assert!(plugin.command("next", &json!({})).is_err());
+        assert!(plugin
+            .command(
+                "seek",
+                &json!({"session":"ab".repeat(16),"position":2.5,"track_id":"/track"})
+            )
+            .is_err());
+        assert!(plugin
+            .command(
+                "seek",
+                &json!({"session":"ab".repeat(16),"position":2000,"track_id":"/track"})
+            )
+            .is_ok());
     }
     #[test]
     fn unavailable_stays_unavailable() {

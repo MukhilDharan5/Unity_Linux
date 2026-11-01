@@ -1,0 +1,22 @@
+import {LocalRepository} from '../storage/repository.js';
+import {Controller} from './controller.js';
+import {UnityCompanion} from './unity.js';
+const controller=new Controller(browser,new LocalRepository(browser.storage.local));
+controller.companion=new UnityCompanion(browser,controller);
+controller.repo.onCommit=()=>controller.companion.scheduleSync();
+const safely=fn=>controller.queue(fn).catch(()=>{controller.error='An operation failed. Previously committed data is preserved.';});
+// All listeners are registered synchronously, before initialization or any await.
+browser.runtime.onMessage.addListener((m,s)=>controller.queue(()=>controller.message(m,s)).catch(()=>({ok:false,reason:'Operation failed; previous data preserved'})));
+browser.runtime.onStartup.addListener(()=>{controller.startupRequested=true;controller.startup().catch(()=>{});});
+browser.runtime.onInstalled.addListener(()=>safely(()=>controller.installed()));
+browser.tabs.onActivated.addListener(info=>{controller.focusSerial++;safely(()=>controller.select(info.tabId));});
+browser.tabs.onRemoved.addListener(id=>safely(()=>controller.removed(id)));
+browser.tabs.onUpdated.addListener((id,change)=>{if(change.status==='complete')safely(async()=>{await browser.tabs.sendMessage(id,{type:'CONNECT'},{frameId:0}).catch(()=>{});});});
+browser.windows.onFocusChanged.addListener(id=>{controller.focusSerial++;if(id!==browser.windows.WINDOW_ID_NONE)safely(async()=>{const tabs=await browser.tabs.query({active:true,windowId:id});if(tabs[0])await controller.select(tabs[0].id);});});
+browser.webNavigation.onCommitted.addListener(d=>safely(()=>controller.navigation(d,'commit')));
+browser.webNavigation.onHistoryStateUpdated.addListener(d=>safely(()=>controller.navigation(d,'route')));
+browser.webNavigation.onReferenceFragmentUpdated.addListener(d=>safely(()=>controller.navigation(d,'route')));
+browser.permissions.onRemoved.addListener(()=>safely(()=>controller.permissionsChanged(true)));
+browser.permissions.onAdded.addListener(()=>safely(()=>controller.permissionsChanged(false)));
+browser.alarms.onAlarm.addListener(a=>{if(a.name==='continuity-maintenance')safely(()=>controller.repo.maintain());else safely(()=>controller.companion.alarm(a.name));});
+safely(()=>controller.companion.initialize());

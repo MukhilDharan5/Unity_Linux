@@ -1,13 +1,23 @@
 //! GUI-free lifecycle, pairing, authorization-neutral command routing and state.
+mod artwork;
 mod audio;
 mod audio_session;
+mod authentication;
 mod call_alerts;
 mod call_audio;
 mod call_hfp;
+mod clipboard;
+mod desktop;
 mod desktop_control;
+mod desktop_media;
+mod firefox;
+mod gallery;
+mod lan;
 mod phone_alerts;
+mod phone_media;
 mod receipts;
 mod screen_session;
+mod sound;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 pub use screen_session::ScreenFrame;
@@ -20,11 +30,11 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    net::{TcpListener, UdpSocket},
+    net::TcpListener,
     sync::{broadcast, mpsc, oneshot, watch, Mutex, Semaphore},
     time::{interval, timeout},
 };
-use unity_protocol::{Availability, Capability, Message, DISCOVERY_PORT};
+use unity_protocol::{Availability, Capability, Message};
 use unity_security::{Identity, Trust, TrustStore};
 use unity_transport::{network::LanTransport, Kind, Transport, Workload};
 use uuid::Uuid;
@@ -37,6 +47,8 @@ pub struct Device {
     pub state: BTreeMap<String, Value>,
     pub disabled: Vec<String>,
     pub last_error: String,
+    #[serde(skip)]
+    phone_artwork: BTreeMap<String, Value>,
 }
 #[derive(Clone, Serialize)]
 pub struct Operation {
@@ -53,12 +65,17 @@ pub struct Operation {
     #[serde(skip)]
     pub started: Option<Instant>,
     #[serde(skip)]
+    observed: bool,
+    #[serde(skip)]
     generation: String,
 }
 struct Session {
     kind: Kind,
+    local_ip: Option<std::net::IpAddr>,
     generation: String,
     started_at: u64,
+    network_info: bool,
+    biometric_auth: bool,
     tx: mpsc::Sender<Message>,
     stop: watch::Sender<bool>,
 }
@@ -117,6 +134,8 @@ struct State {
     discovery_until: Option<Instant>,
 }
 pub struct Engine {
+    authentication: authentication::Broker,
+    firefox: Arc<firefox::Backend>,
     state: Mutex<State>,
     call_audio: Mutex<call_audio::Router>,
     call_hfp: Mutex<call_hfp::Backend>,
@@ -125,6 +144,13 @@ pub struct Engine {
     call_alerts_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     call_audio_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     receipts: receipts::Notifications,
+    clipboard: clipboard::Backend,
+    clipboard_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    sound: sound::Backend,
+    sound_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    desktop_media: desktop_media::Backend,
+    desktop_media_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    phone_media_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     phone_alerts: phone_alerts::Notifications,
     phone_alerts_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     bluetooth: Mutex<Value>,
@@ -134,6 +160,7 @@ pub struct Engine {
     pub screen_changed: broadcast::Sender<(String, u64)>,
     request_limit: Arc<Semaphore>,
     pub port: u16,
+    lan_ports: Mutex<Vec<u16>>,
     limit: Arc<Semaphore>,
 }
 impl Engine {
@@ -160,6 +187,7 @@ impl Engine {
                     connected: false,
                     capabilities: unity_plugins::capabilities(&[]),
                     state: BTreeMap::new(),
+                    phone_artwork: BTreeMap::new(),
                     disabled: toggles.get(id).cloned().unwrap_or_default(),
                     last_error: String::new(),
                 },
@@ -169,6 +197,8 @@ impl Engine {
         let (screen_changed, _) = broadcast::channel(16);
         let (call_alerts_stop, _) = watch::channel(false);
         Ok(Arc::new(Self {
+            authentication: authentication::Broker::default(),
+            firefox: firefox::Backend::new(&dir, changed.clone())?,
             call_audio: Mutex::new(call_audio::Router::default()),
             call_hfp: Mutex::new(call_hfp::Backend::default()),
             call_hfp_task: Mutex::new(None),
@@ -176,6 +206,13 @@ impl Engine {
             call_alerts_task: Mutex::new(None),
             call_audio_task: Mutex::new(None),
             receipts: receipts::Notifications::new(dir.join("received")),
+            clipboard: clipboard::Backend::default(),
+            clipboard_task: Mutex::new(None),
+            sound: sound::Backend::default(),
+            sound_task: Mutex::new(None),
+            desktop_media: desktop_media::Backend::default(),
+            desktop_media_task: Mutex::new(None),
+            phone_media_task: Mutex::new(None),
             phone_alerts: phone_alerts::Notifications::new(),
             phone_alerts_task: Mutex::new(None),
             state: Mutex::new(State {
@@ -191,11 +228,32 @@ impl Engine {
             screen_changed,
             request_limit: Arc::new(Semaphore::new(4)),
             port,
+            lan_ports: Mutex::new(vec![port]),
             limit: Arc::new(Semaphore::new(16)),
         }))
     }
     pub async fn shutdown_calls(&self) {
         self.call_alerts_stop.send(true).ok();
+        if let Some(mut task) = self.clipboard_task.lock().await.take() {
+            if timeout(Duration::from_secs(4), &mut task).await.is_err() {
+                task.abort();
+            }
+        }
+        if let Some(mut task) = self.phone_media_task.lock().await.take() {
+            if timeout(Duration::from_secs(5), &mut task).await.is_err() {
+                task.abort();
+            }
+        }
+        if let Some(mut task) = self.sound_task.lock().await.take() {
+            if timeout(Duration::from_secs(7), &mut task).await.is_err() {
+                task.abort();
+            }
+        }
+        if let Some(mut task) = self.desktop_media_task.lock().await.take() {
+            if timeout(Duration::from_secs(5), &mut task).await.is_err() {
+                task.abort();
+            }
+        }
         if let Some(mut task) = self.call_hfp_task.lock().await.take() {
             if timeout(Duration::from_secs(6), &mut task).await.is_err() {
                 task.abort();
@@ -608,6 +666,15 @@ impl Engine {
         if !enabled {
             d.disabled.push(feature.into());
             d.state.remove(feature);
+            if feature == "sound" {
+                d.state.remove("desktop_sound");
+            }
+            if feature == "media" {
+                d.phone_artwork.clear();
+                d.state.remove("desktop_media");
+                d.state.remove("sound");
+                d.state.remove("desktop_sound");
+            }
         }
         if feature == "audio" && !enabled {
             audio_session::cancel_device(&s, id);
@@ -616,9 +683,11 @@ impl Engine {
             screen_session::cancel_device(&mut s, id);
         }
         if let Some(session) = s.sessions.get(id).filter(|_| {
-            s.devices
-                .get(id)
-                .is_some_and(|d| d.capabilities.iter().any(|c| c.id == "lock"))
+            s.devices.get(id).is_some_and(|d| {
+                d.capabilities
+                    .iter()
+                    .any(|c| matches!(c.id.as_str(), "lock" | "desktop_media" | "sound"))
+            })
         }) {
             for link in &session.0 {
                 link.tx
@@ -645,20 +714,28 @@ impl Engine {
             .lock()
             .await
             .operations
-            .values()
+            .values_mut()
             .filter(|o| o.owner == owner)
-            .cloned()
+            .map(|o| {
+                if o.status != "running" {
+                    o.observed = true;
+                }
+                o.clone()
+            })
             .collect()
     }
     pub async fn operation(&self, id: &str, owner: &str) -> Result<Operation> {
-        let s = self.state.lock().await;
+        let mut s = self.state.lock().await;
         let o = s
             .operations
-            .get(id)
+            .get_mut(id)
             .ok_or_else(|| anyhow::anyhow!("unknown operation"))?;
         if o.owner != owner {
             bail!("operation belongs to another client")
         };
+        if o.status != "running" {
+            o.observed = true;
+        }
         Ok(o.clone())
     }
     pub async fn cancel(&self, id: &str, owner: &str) -> Result<()> {
@@ -711,7 +788,16 @@ impl Engine {
         if !d.connected {
             bail!("device disconnected")
         };
-        if d.disabled.iter().any(|f| f == feature) {
+        if feature == "photos"
+            && matches!(action, "get" | "copy")
+            && d.disabled.iter().any(|f| f == "files")
+        {
+            bail!("Enable file transfers to download gallery items")
+        }
+        if d.disabled
+            .iter()
+            .any(|f| f == feature || matches!(feature, "desktop_media" | "sound") && f == "media")
+        {
             bail!("feature disabled")
         };
         if !d
@@ -743,11 +829,20 @@ impl Engine {
         {
             bail!("Bluetooth call controls are reconnecting; try again when connected")
         }
+        // A stream's start request is completed once playback/capture begins,
+        // but its operation remains useful for cancellation and failure handling.
+        let streams: Vec<_> = s
+            .audio
+            .iter()
+            .map(|a| a.operation.clone())
+            .chain(s.screens.values().map(|screen| screen.operation.clone()))
+            .collect();
         let expired: Vec<_> = s
             .operations
             .iter()
             .filter(|(_, o)| {
                 o.status != "running"
+                    && !streams.contains(&o.id)
                     && o.started
                         .is_some_and(|t| t.elapsed() > Duration::from_secs(600))
             })
@@ -760,19 +855,37 @@ impl Engine {
                 .ok();
         }
         if s.operations.len() >= 512 {
-            bail!("operation history limit reached; completed operations expire after ten minutes")
+            // Gallery thumbnails can fill the history well before its TTL. A
+            // result already read by its owner can be retired under pressure;
+            // running work and unread results must remain available.
+            let oldest = s
+                .operations
+                .iter()
+                .filter(|(_, o)| o.status != "running" && o.observed && !streams.contains(&o.id))
+                .min_by_key(|(_, o)| o.started)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = oldest {
+                s.operations.remove(&id);
+                self.changed.send(format!("remove_operation:{id}")).ok();
+            } else {
+                bail!("operation limit reached; finish running work or read pending results before retrying")
+            }
         }
-        let session = s
-            .sessions
-            .get(device)
-            .and_then(|links| links.select(unity_transport::workload(feature)))
-            .context("device disconnected")?;
+        let session = if feature == "audio" {
+            audio_session::select_session(&s, device, &data)?
+        } else {
+            s.sessions
+                .get(device)
+                .and_then(|links| links.select(unity_transport::workload(feature)))
+                .context("device disconnected")?
+        };
         let tx = session.tx.clone();
         let transport_kind = session.kind;
         let generation = session.generation.clone();
+        let media_generation = generation.clone();
         let id = Uuid::new_v4().simple().to_string();
         let audio_work = if feature == "audio" {
-            Some(audio_session::prepare(&mut s, device, action, &id)?)
+            Some(audio_session::prepare(&mut s, device, action, &data, &id)?)
         } else {
             None
         };
@@ -794,6 +907,7 @@ impl Engine {
                 error: String::new(),
                 owner: owner.into(),
                 started: Some(Instant::now()),
+                observed: false,
                 generation,
             },
         );
@@ -804,6 +918,36 @@ impl Engine {
         let a = action.to_string();
         let call_device = device.to_owned();
         tokio::spawn(async move {
+            if f == "sound" && data["source"] == "desktop" {
+                let result = engine
+                    .sound
+                    .control(&engine, &call_device, &media_generation, &a, &data, &op)
+                    .await;
+                match result {
+                    Ok(value) => engine.finish(&op, true, value, String::new()).await,
+                    Err(error) => {
+                        engine
+                            .finish(&op, false, Value::Null, error.to_string())
+                            .await
+                    }
+                }
+                return;
+            }
+            if f == "desktop_media" {
+                let result = engine
+                    .desktop_media
+                    .control(&engine, &call_device, &media_generation, &a, &data, &op)
+                    .await;
+                match result {
+                    Ok(value) => engine.finish(&op, true, value, String::new()).await,
+                    Err(error) => {
+                        engine
+                            .finish(&op, false, Value::Null, error.to_string())
+                            .await
+                    }
+                }
+                return;
+            }
             if f == "call_control"
                 && (a.starts_with("hfp_")
                     || hfp
@@ -850,9 +994,19 @@ impl Engine {
                     Duration::from_secs(10),
                     tx.send(Message::Command {
                         id: op.clone(),
-                        feature: f,
-                        action: a,
-                        data,
+                        feature: f.clone(),
+                        action: if f == "photos" && a == "copy" {
+                            "get".to_owned()
+                        } else {
+                            a.clone()
+                        },
+                        data: if f == "photos" && matches!(a.as_str(), "get" | "copy") {
+                            let mut payload = data;
+                            payload["transfer_id"] = json!(op);
+                            payload
+                        } else {
+                            data
+                        },
                     }),
                 )
                 .await
@@ -992,7 +1146,45 @@ impl Engine {
             tracing::warn!(%error, "Could not restore previous audio route; retrying on next audio request");
         }
         let listener = TcpListener::bind((bind, self.port)).await?;
+        self.start_extra_lan(bind).await?;
         self.receipts.start().await;
+        let clipboard_engine = self.clone();
+        let clipboard_stop = self.call_alerts_stop.subscribe();
+        *self.clipboard_task.lock().await = Some(tokio::spawn(async move {
+            clipboard_engine
+                .clipboard
+                .run(clipboard_engine.clone(), clipboard_stop)
+                .await;
+        }));
+        let phone_media_engine = self.clone();
+        let phone_media_stop = self.call_alerts_stop.subscribe();
+        *self.phone_media_task.lock().await = Some(tokio::spawn(async move {
+            if let Err(error) = phone_media::run(phone_media_engine, phone_media_stop).await {
+                tracing::warn!(%error, "Phone system media controls unavailable");
+            }
+        }));
+        let sound_engine = self.clone();
+        let sound_stop = self.call_alerts_stop.subscribe();
+        *self.sound_task.lock().await = Some(tokio::spawn(async move {
+            if let Err(error) = sound_engine
+                .sound
+                .run(sound_engine.clone(), sound_stop)
+                .await
+            {
+                tracing::warn!(%error,"Sound controls unavailable");
+            }
+        }));
+        let media_engine = self.clone();
+        let media_stop = self.call_alerts_stop.subscribe();
+        *self.desktop_media_task.lock().await = Some(tokio::spawn(async move {
+            if let Err(error) = media_engine
+                .desktop_media
+                .run(media_engine.clone(), media_stop)
+                .await
+            {
+                tracing::warn!(%error,"Laptop media unavailable");
+            }
+        }));
         let phone_engine = self.clone();
         let phone_stop = self.call_alerts_stop.subscribe();
         *self.phone_alerts_task.lock().await = Some(tokio::spawn(async move {
@@ -1046,42 +1238,7 @@ impl Engine {
         tokio::spawn(async move {
             engine.serve_bluetooth().await;
         });
-        let engine = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = engine.discovery_server(bind_any()).await {
-                tracing::warn!(error=%e,"LAN discovery disabled")
-            }
-        });
-        loop {
-            let (socket, addr) = listener.accept().await?;
-            if !match addr.ip() {
-                std::net::IpAddr::V4(ip) => {
-                    ip.is_private() || ip.is_loopback() || ip.is_link_local()
-                }
-                std::net::IpAddr::V6(ip) => {
-                    ip.is_unique_local() || ip.is_loopback() || ip.is_unicast_link_local()
-                }
-            } {
-                continue;
-            }
-            let Ok(permit) = self.limit.clone().try_acquire_owned() else {
-                continue;
-            };
-            let engine = self.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let result = async {
-                    socket.set_nodelay(true)?;
-                    engine
-                        .accept_stream(Box::new(socket), unity_transport::Kind::Lan, None)
-                        .await
-                }
-                .await;
-                if let Err(e) = result {
-                    tracing::debug!(peer=%addr,error=%e,"peer session ended")
-                }
-            });
-        }
+        self.serve_lan_listener(listener).await
     }
     pub async fn bluetooth_info(&self) -> Value {
         self.bluetooth.lock().await.clone()
@@ -1103,7 +1260,7 @@ impl Engine {
                             let engine = self.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                if let Err(e) = engine.accept_stream(Box::new(incoming.stream), unity_transport::Kind::Bluetooth, Some(incoming.channel)).await {
+                                if let Err(e) = engine.accept_stream(Box::new(incoming.stream), unity_transport::Kind::Bluetooth, Some(incoming.channel), None).await {
                                     tracing::debug!(peer=%incoming.device,error=%e,"Bluetooth session ended");
                                 }
                             });
@@ -1124,6 +1281,7 @@ impl Engine {
         socket: Box<dyn unity_transport::StreamIo>,
         kind: unity_transport::Kind,
         channel: Option<unity_transport::bluetooth::Channel>,
+        local_ip: Option<std::net::IpAddr>,
     ) -> Result<()> {
         use unity_transport::bluetooth::Channel;
         let acceptor = tokio_rustls_acceptor(self.identity.server_config()?);
@@ -1158,55 +1316,24 @@ impl Engine {
                 } else {
                     LanTransport::new(tls)
                 };
-                self.authenticate_and_run(&mut transport, hello).await
+                self.authenticate_and_run(&mut transport, hello, local_ip)
+                    .await
             }
             _ => bail!("Unexpected hello for this transport channel"),
-        }
-    }
-    async fn discovery_server(self: Arc<Self>, bind: &str) -> Result<()> {
-        let socket = UdpSocket::bind((bind, DISCOVERY_PORT)).await?;
-        let mut b = [0; 64];
-        let mut last = HashMap::new();
-        loop {
-            let (n, addr) = socket.recv_from(&mut b).await?;
-            if &b[..n] != b"UNITY_DISCOVER_V1" {
-                continue;
-            };
-            let enabled = self
-                .state
-                .lock()
-                .await
-                .discovery_until
-                .is_some_and(|t| t > Instant::now());
-            if !enabled {
-                continue;
-            };
-            if last
-                .get(&addr.ip())
-                .is_some_and(|t: &Instant| t.elapsed() < Duration::from_secs(1))
-            {
-                continue;
-            };
-            if last.len() > 128 {
-                last.clear()
-            };
-            last.insert(addr.ip(), Instant::now());
-            let payload = serde_json::to_vec(
-                &json!({"version":1,"name":"Unity Linux","port":self.port,"fingerprint":self.identity.fingerprint}),
-            )?;
-            socket.send_to(&payload, addr).await?;
         }
     }
     async fn authenticate_and_run(
         self: &Arc<Self>,
         t: &mut dyn Transport,
         hello: Message,
+        local_ip: Option<std::net::IpAddr>,
     ) -> Result<()> {
         let Message::Hello {
             version,
             device_id: id,
             name,
             capabilities,
+            network_info,
         } = hello
         else {
             bail!("expected hello")
@@ -1278,6 +1405,7 @@ impl Engine {
                         connected: false,
                         capabilities: unity_plugins::capabilities(&capabilities),
                         state: BTreeMap::new(),
+                        phone_artwork: BTreeMap::new(),
                         disabled: vec![],
                         last_error: String::new(),
                     },
@@ -1311,6 +1439,11 @@ impl Engine {
             let first = links.0.is_empty();
             links.0.push(Session {
                 kind,
+                local_ip,
+                network_info,
+                biometric_auth: capabilities
+                    .iter()
+                    .any(|c| c.id == "authentication" && c.status == Availability::Available),
                 generation: generation.clone(),
                 started_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1325,24 +1458,31 @@ impl Engine {
             d.name = name;
             if first {
                 d.state.clear();
+                d.phone_artwork.clear();
             }
             d.state.insert("transport".into(), transport);
             d.last_error.clear();
             d.capabilities = unity_plugins::capabilities(&capabilities);
         }
         self.changed.send(id.clone()).ok();
+        tracing::info!(device=%id,transport=?t.kind(),"Authenticated device connected");
         let result=async {
  t.send(&Message::Ready).await?;
- if capabilities.iter().any(|c| c.id == "lock") { let s=self.state.lock().await; t.send(&Message::Capabilities { capabilities: desktop_control::capabilities(&s.devices[&id].disabled) }).await?; }
+ if capabilities.iter().any(|c| matches!(c.id.as_str(),"lock"|"desktop_media"|"sound")) { let s=self.state.lock().await; t.send(&Message::Capabilities { capabilities: desktop_control::capabilities(&s.devices[&id].disabled) }).await?; }
+ if network_info && self.state.lock().await.devices.get(&id).is_some_and(|d| !d.disabled.iter().any(|f| f=="connectivity")) {
+ t.send(&Message::Event {feature:"connectivity".into(),data:self.network_info().await}).await?;
+ }
  let mut heartbeat=interval(Duration::from_secs(30));heartbeat.tick().await;
- let mut last_seen=Instant::now();let mut files=unity_plugins::transfer::Receiver::new(self.dir.join("received"))?;
+ let mut last_seen=Instant::now();let mut invalid_events=0u8;let mut gallery=gallery::Downloads::new(self.dir.join("clipboard-files"))?;let mut files=unity_plugins::transfer::Receiver::new(self.dir.join("received"))?;let mut gallery_files=HashMap::<String,PathBuf>::new();
  loop{tokio::select!{
  _=cancel.changed()=>{bail!("session cancelled")},
- _=heartbeat.tick()=>{if last_seen.elapsed()>Duration::from_secs(90){bail!("peer heartbeat timed out")};timeout(Duration::from_secs(10),t.send(&Message::Ping)).await??;},
+ _=heartbeat.tick()=>{gallery.prune();if last_seen.elapsed()>Duration::from_secs(90){bail!("peer heartbeat timed out")};timeout(Duration::from_secs(10),t.send(&Message::Ping)).await??;},
  outbound=rx.recv()=>{let Some(m)=outbound else{break};timeout(Duration::from_secs(10),t.send(&m)).await??;},
  incoming=t.receive()=>{let message=incoming?;last_seen=Instant::now();if self.state.lock().await.sessions.get(&id).and_then(|links| links.generation(&generation)).is_none(){bail!("session replaced")};match message{
+ Message::AuthResponse{id:request,signature}=>{self.authentication_response(&id,&generation,&request,signature).await;},
  Message::Ping=>{t.send(&Message::Pong).await?},Message::Pong=>{},
- Message::Capabilities{capabilities}=>{unity_protocol::validate_hello(1,&id,"device",&capabilities)?;let mut s=self.state.lock().await;if let Some(d)=s.devices.get_mut(&id){d.capabilities=unity_plugins::capabilities(&capabilities);let allowed:Vec<_>=d.capabilities.iter().filter(|c|c.status==Availability::Available).map(|c|c.id.clone()).collect();d.state.retain(|f,_|f == "transport" || (f == "call_audio" && allowed.iter().any(|a| a=="call_control")) || allowed.contains(f));if !allowed.iter().any(|f| f=="audio"){audio_session::cancel_device(&s,&id);}
+ Message::Capabilities{capabilities}=>{unity_protocol::validate_hello(1,&id,"device",&capabilities)?;let mut s=self.state.lock().await;if let Some(link)=s.sessions.get_mut(&id).and_then(|links|links.0.iter_mut().find(|l|l.generation==generation)){link.biometric_auth=capabilities.iter().any(|c|c.id=="authentication" && c.status==Availability::Available);}
+if let Some(d)=s.devices.get_mut(&id){d.capabilities=unity_plugins::capabilities(&capabilities);let allowed:Vec<_>=d.capabilities.iter().filter(|c|c.status==Availability::Available).map(|c|c.id.clone()).collect();d.state.retain(|f,_|f == "transport" || (f == "desktop_sound" && allowed.iter().any(|a| a=="sound")) || (f == "call_audio" && allowed.iter().any(|a| a=="call_control")) || allowed.contains(f));if !allowed.iter().any(|f| f=="audio"){audio_session::cancel_device(&s,&id);}
  if !allowed.iter().any(|f| f=="screen"){screen_session::cancel_device(&mut s,&id);}}drop(s);if !self.device(&id).await?.capabilities.iter().any(|c| c.id=="call_control" && c.status==Availability::Available) { self.stop_call_audio(&id).await; }self.changed.send(id.clone()).ok();},
  Message::Request { id: request_id, feature, action, data } => {
  if let Ok(permit) = self.request_limit.clone().try_acquire_owned() {
@@ -1351,28 +1491,68 @@ impl Engine {
  } else { t.send(&Message::Result { id:request_id,ok:false,data:Value::Null,error:"Too many desktop requests".into() }).await?; }
  },
  Message::Event{feature,data}=>{
- let p=unity_plugins::plugin(&feature).context("unknown event feature")?;p.event(&data)?;
- let allowed={let s=self.state.lock().await;let d=s.devices.get(&id).context("revoked device")?;!d.disabled.contains(&feature)&&d.capabilities.iter().any(|c|c.id==feature&&c.status==Availability::Available)};
+ // Laptop snapshots and foreign-origin media are display-only. Drop echoes
+ // before cache/dispatch so they can never become phone-native sessions.
+ if feature=="sound" && data["origin"]!="phone" || feature=="desktop_media" || feature=="media" && data.get("origin").is_some_and(|o| o!="phone") { continue; }
+ let validation=unity_plugins::plugin(&feature).context("unknown event feature").and_then(|p|p.event(&data));
+ if let Err(error)=validation {invalid_events=invalid_events.saturating_add(1);tracing::warn!(feature=%feature.chars().take(64).collect::<String>(),error=%error,"Rejected feature update; connection retained");if invalid_events>=8{bail!("Too many invalid feature updates")};continue;}
+ let allowed={let s=self.state.lock().await;let d=s.devices.get(&id).context("revoked device")?;!d.disabled.contains(&feature)&&!(feature=="sound" && d.disabled.iter().any(|f|f=="media"))&&d.capabilities.iter().any(|c|c.id==feature&&c.status==Availability::Available)};
  if !allowed{continue};
+ if feature=="clipboard" { self.clipboard.received(&id,&generation,data["text"].as_str().unwrap()); }
+ if feature=="media" && data["kind"]=="artwork" && self.state.lock().await.devices.get(&id).is_none_or(|d| d.disabled.iter().any(|f| f=="media_artwork")) {continue;}
  if feature=="call_control" && data["backend"]=="bluetooth_hfp" {
  let mut state=self.state.lock().await;let d=state.devices.get_mut(&id).context("revoked device")?;
  if d.state.get("call_control").is_none_or(|v| v["backend"]!="bluetooth_hfp") { d.state.insert("call_control".into(),data); }
  drop(state);self.publish_hfp().await;continue;
  }
  if feature=="call_control" && (data["calls"].as_array().is_some_and(|c| c.is_empty()) || data["route"]!="bluetooth") { self.stop_call_audio(&id).await; }
- let value=if feature=="files"{let chunk=data["phase"]=="chunk";let received=files.event(&data)?;if chunk{continue};if data["phase"]=="abort"{json!({"state":"cancelled","id":data["id"]})}else if let Some(path)=received{json!({"received_path":path,"state":"completed"})}else{json!({"state":"receiving","id":data["id"]})}}else{data};
+ if feature=="files" {
+ let clipboard_request={let state=self.state.lock().await;state.operations.get(data["id"].as_str().unwrap_or("")).is_some_and(|o|o.device==id&&o.generation==generation&&o.feature=="photos"&&o.action=="copy"&&o.status=="running")};
+ if gallery.event(&data,clipboard_request)?{continue;}
+ }
+ let value=if feature=="files"{let chunk=data["phase"]=="chunk";let received=files.event(&data)?;if chunk{continue};if data["phase"]=="abort"{json!({"state":"cancelled","id":data["id"]})}else if let Some(mut path)=received{
+ let transfer=data["id"].as_str().unwrap_or("");
+ let state=self.state.lock().await;
+ if state.operations.get(transfer).is_some_and(|o|o.device==id&&o.generation==generation&&o.feature=="photos"&&o.action=="get"&&o.status=="running") {
+  path=gallery::original_name(&path,transfer);
+  gallery_files.retain(|key,_|state.operations.get(key).is_some_and(|o|o.status=="running"));
+  gallery_files.insert(transfer.to_owned(),path.clone());
+ }
+ json!({"received_path":path,"state":"completed"})}else{json!({"state":"receiving","id":data["id"]})}}else{data};
  let mut s=self.state.lock().await;let d=s.devices.get_mut(&id).context("revoked device")?;
  self.receipts.received(&d.name, &feature, &value);
  self.phone_alerts.received(&id, &generation, &feature, &value);
- if feature=="notifications"{let notifications=d.state.entry(feature.clone()).or_insert_with(||json!({})).as_object_mut().context("invalid notification state")?;let key=value["id"].as_str().context("missing notification ID")?.to_string();if value["removed"].as_bool().unwrap_or(false){notifications.remove(&key);}else{if notifications.len()>=200{notifications.clear()};notifications.insert(key,value);}}else if feature=="sms" {let previous=d.state.entry(feature).or_insert_with(||json!({}));previous["revision"]=value["revision"].clone();if let Some(message)=value["message_id"].as_str() {if !previous["reports"].is_object(){previous["reports"]=json!({});}let reports=previous["reports"].as_object_mut().unwrap();if reports.len()>=100&&!reports.contains_key(message){reports.clear();}reports.insert(message.into(),value);}}else{d.state.insert(feature,value);}
+ if feature=="notifications"{let notifications=d.state.entry(feature.clone()).or_insert_with(||json!({})).as_object_mut().context("invalid notification state")?;let key=value["id"].as_str().context("missing notification ID")?.to_string();if value["removed"].as_bool().unwrap_or(false){notifications.remove(&key);}else{if notifications.len()>=200{notifications.clear()};notifications.insert(key,value);}}else if feature=="sms" {let previous=d.state.entry(feature).or_insert_with(||json!({}));previous["revision"]=value["revision"].clone();if let Some(message)=value["message_id"].as_str() {if !previous["reports"].is_object(){previous["reports"]=json!({});}let reports=previous["reports"].as_object_mut().unwrap();if reports.len()>=100&&!reports.contains_key(message){reports.clear();}reports.insert(message.into(),value);}}else if feature=="media"{artwork::phone_event(d,value);}else{d.state.insert(feature,value);}
  drop(s);self.changed.send(id.clone()).ok();
  },
- Message::Result{id:op,ok,data,error}=>{if error.len()>512||serde_json::to_vec(&data)?.len()>unity_protocol::MAX_TEXT{bail!("operation response too large")};let operation=self.state.lock().await.operations.get(&op).filter(|o|o.device==id&&o.generation==generation&&o.status=="running").cloned();if let Some(operation)=operation{if operation.feature=="audio" || operation.feature=="screen" {if !ok {let mut state=self.state.lock().await; if operation.feature=="audio" {audio_session::cancel_device(&state,&id);}else{screen_session::cancel_device(&mut state,&id);}drop(state);self.finish(&op,false,data,error).await;}continue;}
+ Message::Result{id:op,ok,data,error}=>{self.clipboard.result(&id,&generation,&op,ok);if error.len()>512||serde_json::to_vec(&data)?.len()>unity_protocol::MAX_TEXT{bail!("operation response too large")};if !ok && self.phone_audio_failed(&id,&generation,&op,&error).await {continue;}let operation=self.state.lock().await.operations.get(&op).filter(|o|o.device==id&&o.generation==generation&&o.status=="running").cloned();if let Some(operation)=operation{
+if operation.feature=="photos" && operation.action=="get" && ok {
+ let file=gallery_files.remove(&op).filter(|_|data["transfer_id"].as_str()==Some(op.as_str()));
+ if let Some(path)=file {let mut data=data;data["received_path"]=json!(path);self.finish(&op,true,data,String::new()).await;}
+ else {self.finish(&op,false,Value::Null,"Gallery download was not verified; update the phone companion and retry".into()).await;}
+ continue;
+}
+if operation.feature=="photos" && operation.action=="copy" {
+ if !ok { self.finish(&op,false,data,error).await;continue; }
+ let file=gallery.take(&op).and_then(|file|{if data["transfer_id"].as_str()==Some(op.as_str()){Ok(file)}else{Err(anyhow::anyhow!("Gallery transfer did not match its clipboard request"))}});
+ let engine=self.clone();let device=id.clone();let generation=generation.clone();
+ tokio::spawn(async move {
+ let result=async {let file=file?;{let state=engine.state.lock().await;
+ if !state.operations.get(&op).is_some_and(|o|o.status=="running") || !state.devices.get(&device).is_some_and(|d|d.connected&&!d.disabled.iter().any(|f|f=="photos"||f=="files")) || state.sessions.get(&device).and_then(|s|s.generation(&generation)).is_none(){bail!("Gallery permission or connection changed")}}
+ clipboard::copy_file(file).await?;Ok::<_,anyhow::Error>(json!({"state":"copied","temporary":true}))}.await;
+ match result {Ok(value)=>engine.finish(&op,true,value,String::new()).await,Err(error)=>engine.finish(&op,false,Value::Null,error.to_string()).await}
+ });continue;
+}
+if operation.feature=="audio" || operation.feature=="screen" {if !ok {let mut state=self.state.lock().await; if operation.feature=="audio" {audio_session::cancel_device(&state,&id);}else{screen_session::cancel_device(&mut state,&id);}drop(state);self.finish(&op,false,data,error).await;}continue;}
 if ok{unity_plugins::previews::validate_result(&operation.feature,&operation.action,&data)?;if operation.feature=="call_control" { unity_plugins::call_control::validate_result(&operation.action,&data)?; }}self.finish(&op,ok,data,error).await}},
  _=>bail!("unexpected session message")
  }}
  }}Ok::<_,anyhow::Error>(())
  }.await;
+        self.authentication_disconnected(&generation).await;
+        if let Err(error) = &result {
+            tracing::info!(device=%id,transport=?t.kind(),%error,"Device connection ended");
+        }
         if !self.device(&id).await?.connected
             || self
                 .state
@@ -1403,6 +1583,7 @@ if ok{unity_plugins::previews::validate_result(&operation.feature,&operation.act
                     d.state.insert("transport".into(), transport);
                 } else {
                     d.state.clear();
+                    d.phone_artwork.clear();
                 }
                 d.last_error = if connected {
                     String::new()
@@ -1436,9 +1617,6 @@ fn retire_generation(
         operation.error = "The connection used by this operation disconnected; retry to use the remaining connection".into();
         changed.send(format!("operation:{}", operation.id)).ok();
     }
-}
-fn bind_any() -> &'static str {
-    "0.0.0.0"
 }
 fn libc_flag_nofollow() -> i32 {
     libc::O_NOFOLLOW

@@ -6,7 +6,7 @@ impl Plugin for Feature {
     fn spec(&self) -> Spec {
         Spec {
             id: "audio",
-            title: "Laptop audio on phone",
+            title: "Phone and laptop audio",
             group: "media",
             sensitive: true,
             blocked: "",
@@ -15,8 +15,21 @@ impl Plugin for Feature {
     }
     fn command(&self, action: &str, data: &Value) -> Result<()> {
         validate_command(self.spec(), action, data)?;
-        if data.as_object().is_none_or(|data| !data.is_empty()) {
-            bail!("audio routing takes no client parameters")
+        let object = data
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Expected audio options"))?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "source" | "transport"))
+            || object
+                .get("source")
+                .is_some_and(|v| !matches!(v.as_str(), Some("desktop" | "phone")))
+            || object
+                .get("transport")
+                .is_some_and(|v| !matches!(v.as_str(), Some("auto" | "lan" | "bluetooth")))
+            || action == "stop" && !object.is_empty()
+        {
+            bail!("Choose audio source desktop/phone and transport auto/lan/bluetooth")
         }
         Ok(())
     }

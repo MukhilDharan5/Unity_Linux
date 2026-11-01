@@ -6,6 +6,7 @@ import json
 import os
 import time
 import unittest
+from unittest.mock import patch
 from gi.repository import Gio, GLib
 import integration as harness
 from integration import DEVICE, Peer, wait_for
@@ -17,20 +18,39 @@ PORTAL_XML = '''<node><interface name="org.freedesktop.portal.OpenURI">
 </interface></node>'''
 class Receipts(harness.Integration):
     @classmethod
+    def start_daemon(cls):
+        # A portal failure must use the exact saved target without opening a real viewer.
+        stub = cls.bin / 'gio'
+        stub.write_text('''#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+with (Path(__file__).resolve().parents[1] / 'gio-open.log').open('a') as log:
+    log.write(json.dumps([sys.argv[1:], os.environ.get('XDG_ACTIVATION_TOKEN')]) + '\\n')
+''')
+        stub.chmod(0o755)
+        with patch.dict(os.environ, {'PATH': str(cls.bin) + os.pathsep + os.environ['PATH']}):
+            super().start_daemon()
+
+    @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.opens = []
+        cls.portal_response = 0
         cls.portal = Gio.DBusConnection.new_for_address_sync(os.environ['DBUS_SESSION_BUS_ADDRESS'],
             Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
         cls.portal.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'RequestName',
             GLib.Variant('(su)', ('org.freedesktop.portal.Desktop', 0)), None, Gio.DBusCallFlags.NONE, 5000, None)
         def open(bus, sender, path, interface, method, parameters, invocation):
             parent, item, options = parameters.unpack()
+            token = options.pop('handle_token')
+            request = '/org/freedesktop/portal/desktop/request/' + sender.lstrip(':').replace('.', '_') + '/' + token
             if method == 'OpenFile':
                 fd = invocation.get_message().get_unix_fd_list().get(item)
                 with os.fdopen(fd, 'rb') as file: item = file.read()
             cls.opens.append((method, item, options))
-            invocation.return_value(GLib.Variant('(o)', ('/org/freedesktop/portal/desktop/request/test/open',)))
+            # Deliberately respond before the method reply to exercise the subscription race.
+            bus.emit_signal(sender, request, 'org.freedesktop.portal.Request', 'Response', GLib.Variant('(ua{sv})', (cls.portal_response, {})))
+            invocation.return_value(GLib.Variant('(o)', (request,)))
         cls.registration = cls.portal.register_object('/org/freedesktop/portal/desktop', Gio.DBusNodeInfo.new_for_xml(PORTAL_XML).interfaces[0], open, None, None)
     @classmethod
     def tearDownClass(cls):
@@ -63,6 +83,7 @@ class Receipts(harness.Integration):
         time.sleep(.05); self.assertEqual(len(self.notices.items), 2)
         peer.event('files', {'phase': 'end', 'id': transfer})
         file = receipt(3); self.assertEqual(file['title'], 'File received')
+        self.notices.dismiss(file['id'])  # Some desktops close the notification before its action.
         self.notices.action(file['id'], 'open'); wait_for(lambda: len(self.opens) == 2)
         self.assertEqual(self.opens[-1][0:2], ('OpenFile', data))
         text = '<img src="file:///secret"> Unicode தமிழ்'
@@ -99,6 +120,31 @@ class Receipts(harness.Integration):
         peer.event('urls', {'url': 'https://example.org/restored'}); restored = receipt(1)
         self.notices.action(restored['id']); wait_for(lambda: len(self.opens) == 5)
         self.assertEqual(self.opens[-1][0:2], ('OpenURI', 'https://example.org/restored'))
+        # A successful request path alone is insufficient. Cancellation must not force Gio,
+        # while a portal Response error must fall back to a real opener invocation.
+        type(self).portal_response = 1
+        peer.event('urls', {'url': 'https://example.org/cancelled'}); cancelled = receipt(2)
+        self.notices.action(cancelled['id']); wait_for(lambda: len(self.opens) == 6)
+        time.sleep(.2); self.assertFalse((self.dir / 'gio-open.log').exists())
+        type(self).portal_response = 2
+        fallback = 'https://example.org/fallback?original=1&second=2'
+        peer.event('urls', {'url': fallback}); failed = receipt(3)
+        self.notices.token(failed['id'], 'fallback-activation')
+        self.notices.action(failed['id']); wait_for(lambda: (self.dir / 'gio-open.log').exists())
+        calls = [json.loads(line) for line in (self.dir / 'gio-open.log').read_text().splitlines()]
+        self.assertEqual(calls, [[['open', fallback], 'fallback-activation']])
+        self.assertEqual(len(self.opens), 7)
+        transfer = 'ef' * 16
+        peer.event('files', {'phase': 'begin', 'id': transfer, 'name': 'fallback space.bin', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        peer.event('files', {'phase': 'chunk', 'id': transfer, 'data': base64.b64encode(data).decode()})
+        peer.event('files', {'phase': 'end', 'id': transfer})
+        failed_file = receipt(4); self.notices.action(failed_file['id'])
+        wait_for(lambda: len((self.dir / 'gio-open.log').read_text().splitlines()) == 2)
+        calls = [json.loads(line) for line in (self.dir / 'gio-open.log').read_text().splitlines()]
+        saved = self.state / 'received' / (transfer + '-fallback space.bin')
+        self.assertEqual(calls[-1], [['open', str(saved)], None])
+        self.assertEqual(saved.read_bytes(), data)
+        self.assertEqual(self.opens[-1][0:2], ('OpenFile', data))
         peer.close()
 
 if __name__ == '__main__': unittest.main(verbosity=2)

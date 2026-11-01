@@ -28,6 +28,8 @@ async fn main() -> Result<()> {
         a.port,
     )?;
     let _bus = unity_ipc::serve(engine.clone()).await?;
+    engine.start_firefox().await;
+    engine.start_authentication().await;
     tracing::info!(
         port = a.port,
         "Unity daemon ready; pairing is closed until requested through D-Bus"

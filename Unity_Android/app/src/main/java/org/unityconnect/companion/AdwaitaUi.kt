@@ -1,12 +1,19 @@
 package org.unityconnect.companion
 
 import android.content.Context
+import android.app.AlertDialog
+import android.content.DialogInterface
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.graphics.drawable.InsetDrawable
+import android.graphics.drawable.StateListDrawable
 import android.text.InputType
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.RelativeSizeSpan
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -25,6 +32,7 @@ class AdwaitaUi(private val context: Context) {
  val accentSoft = context.getColor(R.color.unity_accent_soft)
  val success = context.getColor(R.color.unity_success)
  val successSoft = context.getColor(R.color.unity_success_soft)
+ val destructive = context.getColor(R.color.unity_destructive)
  val compactActions = context.resources.configuration.fontScale > 1.3f || context.resources.configuration.screenWidthDp < 360
  fun dp(value: Int) = (value * context.resources.displayMetrics.density + .5f).toInt()
  fun shape(color: Int, radius: Int = 12, outlined: Boolean = false) = GradientDrawable().apply {
@@ -73,13 +81,77 @@ class AdwaitaUi(private val context: Context) {
   return Row(row, titleView, descriptionView)
  }
  fun describe(row: Row, value: String) { row.subtitle.text = value; row.subtitle.visibility = if (value.isBlank()) View.GONE else View.VISIBLE }
- fun button(title: String, suggested: Boolean = false, action: () -> Unit) = Button(context).apply {
-  text = title; isAllCaps = false; textSize = 15f; typeface = Typeface.create("sans-serif", Typeface.BOLD)
-  setTextColor(if (suggested) Color.WHITE else this@AdwaitaUi.text)
-  background = ripple(if (suggested) accent else context.getColor(R.color.unity_button))
+ fun styleButton(button: Button, suggested: Boolean = false, destructive: Boolean = false) = button.apply {
+  isAllCaps = false; textSize = 15f; typeface = Typeface.create("sans-serif", Typeface.BOLD)
+  setSingleLine(false); ellipsize = null
+  val color = if (destructive) this@AdwaitaUi.destructive else accent
+  setTextColor(ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()), intArrayOf(muted, if (suggested || destructive) Color.WHITE else this@AdwaitaUi.text)))
+  backgroundTintList = null; stateListAnimator = null; elevation = 0f
+  background = StateListDrawable().apply {
+   addState(intArrayOf(-android.R.attr.state_enabled), shape(context.getColor(R.color.unity_button)))
+   addState(intArrayOf(), ripple(if (suggested || destructive) color else context.getColor(R.color.unity_button)))
+  }
   minHeight = dp(48); minimumHeight = dp(48); minWidth = dp(48); minimumWidth = dp(48)
-  setPadding(dp(18), dp(12), dp(18), dp(12)); setOnClickListener { action() }
+  setPadding(dp(18), dp(12), dp(18), dp(12))
  }
+ fun button(title: String, suggested: Boolean = false, destructive: Boolean = false, action: () -> Unit) = styleButton(Button(context), suggested, destructive).apply {
+  text = title; setOnClickListener { action() }
+ }
+ fun action(card: LinearLayout, title: String, suggested: Boolean = false, destructive: Boolean = false, click: () -> Unit): Button {
+  val button = button(title, suggested, destructive, click)
+  card.addView(button, LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(16), dp(8), dp(16), dp(8)) })
+  return button
+ }
+ fun iconButton(resource: Int, description: String, action: () -> Unit) = ImageButton(context).apply {
+  setImageResource(resource); imageTintList = ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()), intArrayOf(border, text))
+  contentDescription = description; tooltipText = description
+  backgroundTintList = null; background = ripple(context.getColor(R.color.unity_button))
+  minimumWidth = dp(48); minimumHeight = dp(48); setPadding(dp(12), dp(12), dp(12), dp(12))
+  setOnClickListener { action() }
+ }
+ fun keypad(allowPlus: Boolean = true, pressed: (String) -> Unit) = column().apply {
+  val letters = listOf("", "ABC", "DEF", "GHI", "JKL", "MNO", "PQRS", "TUV", "WXYZ", "", "+", "")
+  "123456789*0#".chunked(3).forEachIndexed { row, digits ->
+   val line = LinearLayout(context).apply { isBaselineAligned = false }
+   digits.forEachIndexed { col, digit ->
+    val caption = letters[row * 3 + col].let { if (digit == '0' && !allowPlus) "" else it }
+    line.addView(button("$digit") { pressed(digit.toString()) }.apply {
+     text = SpannableString("$digit\n${caption.ifEmpty { " " }}").apply {
+      setSpan(RelativeSizeSpan(.45f), 2, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+     }
+     textSize = 24f; contentDescription = "Key $digit"; minimumHeight = dp(64)
+     setPadding(dp(4), dp(8), dp(4), dp(8))
+     if (digit == '0' && allowPlus) setOnLongClickListener { pressed("+"); true }
+    }, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) })
+   }
+   addView(line)
+  }
+ }
+ fun slider(title: String) = SeekBar(context).apply {
+  contentDescription = title; minimumHeight = dp(48)
+  progressTintList = ColorStateList.valueOf(accent); progressBackgroundTintList = ColorStateList.valueOf(border)
+  thumbTintList = ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()), intArrayOf(border, accent))
+  splitTrack = false
+ }
+ fun choices(values: List<String>, chevron: Boolean = false): ArrayAdapter<String> = object : ArrayAdapter<String>(context, 0, values) {
+  override fun getView(position: Int, convertView: View?, parent: ViewGroup): View = if (chevron) {
+   row(getItem(position).orEmpty(), "", R.drawable.ic_media, icon(R.drawable.ic_chevron, size = 18)).view
+  } else choice(getItem(position).orEmpty())
+  override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View = choice(getItem(position).orEmpty())
+ }
+ private fun choice(title: String) = CheckedTextView(context).apply {
+  text = title; textSize = 16f; setTextColor(this@AdwaitaUi.text); gravity = Gravity.CENTER_VERTICAL
+  minimumHeight = dp(56); setPadding(dp(20), dp(14), dp(20), dp(14))
+  checkMarkDrawable = StateListDrawable().apply {
+   addState(intArrayOf(android.R.attr.state_checked), context.getDrawable(R.drawable.ic_check)!!.mutate().apply { setTint(accent) })
+   addState(intArrayOf(), shape(Color.TRANSPARENT).apply { setSize(dp(24), dp(24)) })
+  }
+  background = StateListDrawable().apply {
+   addState(intArrayOf(android.R.attr.state_checked), ripple(accentSoft))
+   addState(intArrayOf(), ripple(Color.TRANSPARENT))
+  }
+ }
+ fun dialog(destructive: Boolean = false) = AdwaitaDialogBuilder(context, this, destructive)
  fun toggle(checked: Boolean, title: String, changed: (Boolean) -> Unit) = Switch(context).apply {
   isChecked = checked; showText = false; switchMinWidth = dp(48); minimumHeight = dp(48)
   thumbDrawable = shape(Color.WHITE, 20).apply { setSize(dp(24), dp(24)); setStroke(dp(1), border) }
@@ -117,6 +189,46 @@ class AdwaitaUi(private val context: Context) {
   item.isSelected = selected; item.background = ripple(if (selected) accentSoft else Color.TRANSPARENT)
   (item.getChildAt(0) as ImageView).imageTintList = ColorStateList.valueOf(if (selected) accentText else muted)
   (item.getChildAt(1) as TextView).setTextColor(if (selected) accentText else muted)
+ }
+}
+
+/** Retains native dialog focus, dismissal and single-choice semantics with the app's styling. */
+class AdwaitaDialogBuilder(context: Context, private val ui: AdwaitaUi, private val destructive: Boolean) : AlertDialog.Builder(context, R.style.Theme_Unity_Dialog) {
+ override fun setTitle(title: CharSequence?): AlertDialog.Builder {
+  super.setTitle(title)
+  return super.setCustomTitle(ui.label(title?.toString().orEmpty(), 20f, true).apply {
+   gravity = Gravity.CENTER; isAccessibilityHeading = true; setPadding(ui.dp(24), ui.dp(24), ui.dp(24), ui.dp(12))
+  })
+ }
+ override fun setSingleChoiceItems(items: Array<out CharSequence>, checkedItem: Int, listener: DialogInterface.OnClickListener?): AlertDialog.Builder =
+  super.setSingleChoiceItems(ui.choices(items.map { it.toString() }), checkedItem, listener)
+ override fun setItems(items: Array<out CharSequence>, listener: DialogInterface.OnClickListener?): AlertDialog.Builder =
+  super.setAdapter(ui.choices(items.map { it.toString() }), listener)
+ override fun create(): AlertDialog = super.create().apply {
+  window?.setBackgroundDrawable(InsetDrawable(ui.shape(ui.surface, 24), ui.dp(16)))
+  setOnShowListener {
+   window?.setLayout(minOf(ui.dp(560), context.resources.displayMetrics.widthPixels), ViewGroup.LayoutParams.WRAP_CONTENT)
+   val buttons = listOf(AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL).mapNotNull { getButton(it) }.filter { it.visibility == View.VISIBLE }
+   val stacked = ui.compactActions || buttons.sumOf { it.paint.measureText(it.text.toString()).toInt() + ui.dp(48) } > minOf(ui.dp(480), context.resources.displayMetrics.widthPixels - ui.dp(80))
+   (buttons.firstOrNull()?.parent as? LinearLayout)?.apply {
+    minimumHeight = ui.dp(64); setPadding(paddingLeft, ui.dp(8), paddingRight, ui.dp(8))
+   }
+   if (stacked) (buttons.firstOrNull()?.parent as? LinearLayout)?.apply {
+    orientation = LinearLayout.VERTICAL
+    for (index in 0 until childCount) if (getChildAt(index) !is Button) getChildAt(index).visibility = View.GONE
+   }
+   for (which in listOf(AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL)) {
+    getButton(which)?.let { button ->
+     ui.styleButton(button, suggested = which == AlertDialog.BUTTON_POSITIVE, destructive = destructive && which == AlertDialog.BUTTON_POSITIVE)
+     (button.layoutParams as? ViewGroup.MarginLayoutParams)?.let { params ->
+      params.setMargins(ui.dp(4), ui.dp(4), ui.dp(4), ui.dp(4)); params.height = ViewGroup.LayoutParams.WRAP_CONTENT
+      if (stacked) { params.width = ViewGroup.LayoutParams.MATCH_PARENT; (params as? LinearLayout.LayoutParams)?.weight = 0f }
+      button.layoutParams = params
+     }
+    }
+   }
+   listView?.apply { divider = null; setPadding(ui.dp(12), ui.dp(8), ui.dp(12), ui.dp(8)) }
+  }
  }
 }
 

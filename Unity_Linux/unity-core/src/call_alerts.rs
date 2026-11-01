@@ -13,6 +13,7 @@ struct Alert {
     notification: u32,
     phase: String,
     caller: String,
+    activation: String,
 }
 fn caller_key(call: &serde_json::Value) -> String {
     call["number"]
@@ -26,6 +27,9 @@ async fn launch_popup(device: &str) {
     launch_client(&["--call-popup", device]).await;
 }
 pub(super) async fn launch_client(options: &[&str]) {
+    launch_client_with_activation(options, "").await;
+}
+pub(super) async fn launch_client_with_activation(options: &[&str], activation: &str) {
     // Only use the sibling installed launcher; it verifies and approves its GTK child.
     // Development/test daemons never launch the user's installed UI.
     let Ok(executable) = std::env::current_exe() else {
@@ -38,44 +42,10 @@ pub(super) async fn launch_client(options: &[&str]) {
         return;
     };
     let mut command = tokio::process::Command::new(directory.join("unityctl"));
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        // The user daemon may have started before Plasma imported its display
-        // environment. Read only display-related values from the user manager.
-        let environment = tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::process::Command::new("systemctl")
-                .args(["--user", "show-environment"])
-                .output(),
-        )
-        .await;
-        let Ok(Ok(environment)) = environment else {
-            return;
-        };
-        let mut has_display = false;
-        for line in String::from_utf8_lossy(&environment.stdout).lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            if [
-                "DISPLAY",
-                "WAYLAND_DISPLAY",
-                "XDG_RUNTIME_DIR",
-                "DBUS_SESSION_BUS_ADDRESS",
-                "XDG_SESSION_TYPE",
-                "XDG_CURRENT_DESKTOP",
-            ]
-            .contains(&key)
-            {
-                command.env(key, value);
-                if ["DISPLAY", "WAYLAND_DISPLAY"].contains(&key) && !value.is_empty() {
-                    has_display = true;
-                }
-            }
-        }
-        if !has_display {
-            return;
-        }
+    if !activation.is_empty() && activation.len() <= 4096 {
+        command.env("XDG_ACTIVATION_TOKEN", activation);
     }
+    command.envs(crate::desktop::environment().await);
     match command.arg("launch-gtk").args(options).spawn() {
         Ok(mut child) => {
             tokio::spawn(async move {
@@ -96,7 +66,7 @@ pub(super) async fn run(
 ) -> Result<()> {
     let bus = zbus::Connection::session().await?;
     let proxy = zbus::Proxy::new(&bus, BUS, "/org/freedesktop/Notifications", BUS).await?;
-    let mut actions = proxy.receive_signal("ActionInvoked").await?;
+    let mut actions = proxy.receive_all_signals().await?;
     let dbus = zbus::fdo::DBusProxy::new(&bus).await?;
     let mut owners = dbus.receive_name_owner_changed().await?;
     let mut changes = engine.changed.subscribe();
@@ -122,10 +92,20 @@ pub(super) async fn run(
             signal = actions.next() => {
                 let Some(signal) = signal else { break };
                 if signal.header().sender().is_none_or(|s| s.as_str() != owner) { continue }
+                match signal.header().member().map(|s| s.as_str()) {
+                    Some("ActivationToken") => {
+                        let (id,token): (u32,String) = signal.body().deserialize()?;
+                        if token.len() <= 4096 { if let Some(alert) = alerts.values_mut().find(|a| a.notification == id) { alert.activation = token; } }
+                        continue;
+                    }
+                    Some("ActionInvoked") => (),
+                    _ => continue,
+                }
                 let (notification,action): (u32,String) = signal.body().deserialize()?;
                 if let Some((device,call)) = alerts.iter().find(|(_,a)| a.notification == notification).map(|(k,_)| k.clone()) {
                     if ["default", "controls"].contains(&action.as_str()) {
-                        launch_popup(&device).await;
+                        let activation = alerts.get_mut(&(device.clone(),call)).map(|a| std::mem::take(&mut a.activation)).unwrap_or_default();
+                        launch_client_with_activation(&["--call-popup", &device], &activation).await;
                     } else if ["answer","reject","hangup", "hold", "unhold"].contains(&action.as_str()) {
                         engine.execute(&device,"call_control",&action,serde_json::json!({"call_id":call}),"native-call-alert").await.ok();
                     }
@@ -289,7 +269,7 @@ pub(super) async fn run(
                     ["hold", "Hold"]
                 });
             }
-            controls.extend(["controls", "Call controls"]);
+            controls.extend(["default", "Call controls", "controls", "Call controls"]);
             let caller = call["name"]
                 .as_str()
                 .filter(|n| !n.is_empty())
@@ -299,6 +279,7 @@ pub(super) async fn run(
             let hints = HashMap::from([
                 ("urgency", Value::from(if ringing { 2u8 } else { 1u8 })),
                 ("resident", Value::from(true)),
+                ("desktop-entry", Value::from("org.unityconnect.Unity")),
             ]);
             let result: zbus::Result<u32> = proxy
                 .call(
@@ -335,6 +316,7 @@ pub(super) async fn run(
                         notification,
                         phase,
                         caller: caller_key(&call),
+                        activation: String::new(),
                     },
                 );
             }

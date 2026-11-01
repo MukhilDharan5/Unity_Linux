@@ -442,6 +442,7 @@ impl Backend {
 }
 
 pub(super) async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
+    let mut retry_delay = Duration::from_secs(2);
     loop {
         let result = async {
             let bus = zbus::Connection::system().await?;
@@ -456,6 +457,7 @@ pub(super) async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
             let mut signals = zbus::MessageStream::for_match_rule(rule,&bus,Some(128)).await?;
             drop(dbus);
             timeout(Duration::from_secs(5),engine.call_hfp.lock().await.initialize(bus)).await??;
+            retry_delay = Duration::from_secs(2);
             let mut tick=interval(Duration::from_secs(1));
             loop {
                 tokio::select! {
@@ -506,7 +508,8 @@ pub(super) async fn run(engine: Arc<Engine>, mut stop: watch::Receiver<bool>) {
             backend.error = reason;
         }
         engine.publish_hfp().await;
-        tokio::select! { _=stop.changed()=>break, _=tokio::time::sleep(Duration::from_secs(2))=>() }
+        tokio::select! { _=stop.changed()=>break, _=tokio::time::sleep(retry_delay)=>() }
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
     }
 }
 #[cfg(test)]

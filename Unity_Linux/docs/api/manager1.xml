@@ -45,6 +45,17 @@
     <method name="PairingInfo">
       <arg type="s" direction="out"/>
     </method>
+    <method name="FirefoxStatus">
+      <arg type="s" direction="out"/>
+    </method>
+    <method name="SetFirefoxEnabled">
+      <arg name="enabled" type="b" direction="in"/>
+    </method>
+    <method name="RestoreFirefoxContext">
+      <arg name="profile_id" type="s" direction="in"/>
+      <arg name="context_id" type="s" direction="in"/>
+      <arg type="s" direction="out"/>
+    </method>
     <method name="ApprovePairing">
       <arg name="device_id" type="s" direction="in"/>
       <arg name="approve" type="b" direction="in"/>

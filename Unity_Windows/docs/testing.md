@@ -1,0 +1,51 @@
+# Windows validation
+
+## Optional local collection revision
+
+The Windows CSV collector has **69 fixture-based checks**; the standard Windows suite passes **197 checks**. The Release solution and self-contained publish compile with zero warnings/errors. The published platform assembly matches the Release build. No real collection was enabled during validation. An earlier isolated `--demo --state-dir` preview reached `UI ready` without creating collection data. Computer Use was not approved to access Unity Phone Companion; the CSV location row and updated consent text have not been visually verified. See [sources, retention, consent and sensor limits](local-collection.md).
+
+The collector checks cover default-off construction, saved/versioned approval, restart identity, five-second native/core/usage polling, original hardware observation times, readable CSV storage and exact columns, Unicode/quoting/mixed-newline round-trips, invariant numbers, structured app/status JSON, sample-ID deduplication, exact 30-minute retention boundaries, startup pruning, cleanup during blocked polls, file-lock retry, legacy checkpoint/temp removal and opt-out cancellation/deletion. Local dates, midnight rollover, idle/lock/display/suspend exclusion, incomplete coverage, complete-day baselines, app names/IDs and native battery conversions/sentinels are also tested. Running usage aggregates are session-local, with no persistent eight-day checkpoint. Native symbols are resolved without invoking collection APIs; real sensor and permission availability is not claimed by fixtures.
+
+## Earlier Windows validation
+
+Validated on 27 October 2026 using .NET SDK 10.0.401, Windows App SDK 2.5.1, NAudio 3.1.0, and the current checked-out Android sources. Linux and Android working-tree changes were preserved.
+
+## Automated and native checks
+
+- Clean WinUI 3 compilation: zero warnings/errors.
+- Standalone self-contained Release publish was launched separately from build output in isolated System, Light and Dark preview profiles. All three reached UI-ready startup without an exception. Its `Unity.pri` resource index is explicitly included in publishing and checked by the build script.
+- 132 protocol and integration checks with actual Windows TLS 1.3: Android HMAC vector, strict frame/UTF-8/identity/capability bounds, certificate pin mismatch, approval gating, bad credentials, DPAPI persistence, name/path rejection, verified/aborted transfers, independent LAN/Bluetooth session behavior, sticky operations, fallback, request deduplication, one-use stream tokens, and unpair cleanup. Audio/screen cases cover exact PCM bytes through fragmented callbacks and TLS, old-packet eviction, capture discontinuities, capture-failure reporting, display-start deferral, stale display requests, view-only rejection, and restoration on stop, failure, permission revocation and control-link loss. Expanded feature cases cover network, URL, clipboard, find, phone volume, media, SMS, call and ringer event payloads; notification update/removal; immutable state snapshots; Windows/Android permission revocation; explicit user-action gating; and failed commands without losing the connection. Incoming SMS alerts now read Android's single-message object and its body.
+- Real Android `Protocol.kt` and `PinnedTls.kt` compiled unchanged: first pairing, reconnect/authentication, Unicode JSON, command/results, and 100 KiB file transfer to Android plus a verified Android-to-Windows file event.
+- Screen streams with a bounded JPEG fixture: Android start schema, phone frame receipt, completion from first real frame without an Android success Result, desktop JPEG framing, input/display capability state, stop cleanup and late Android failure cleanup. A fixture capture backend is used for these deterministic tests; it is not evidence of physical capture latency.
+- Native read-only probe on this computer: Core Audio output and volume read successfully; GSMTC enumeration succeeded (no active player at validation time); Bluetooth advertised all three Unity service UUIDs using authenticated RFCOMM.
+- Native WASAPI capture probe: real output capture, Ready only after PCM, complete 1,928-byte packets (8-byte sequence + 1,920 PCM bytes), monotonic sequences. Probe bytes stayed in memory and were discarded; it did not play sound or save audio.
+- Native display probe: a controlled high-contrast marker moves in captured frames with the local display blanked; remote input leaves the cover intact, the local restore shortcut works, and restoration succeeds. The marker has its own window message loop, is explicitly shown, and uses a bounded wait for fresh frames. This replaces a text-only marker that did not reliably repaint. Frames stay in memory. This verifies black-screen mode, not physical panel power-off. True power-off was previously tested and rejected because capture freezes or the panel wakes.
+- Earlier UI inspection, before the Mica redesign, covered the sidebar, metrics, preference rows and notification cards. Preview controls are disabled and the footer labels sample data.
+
+The [opaque, rounded rectangular shell](ui.md) disables system backdrops and uses solid full-height lighter navigation/darker content panes. Buttons, fields, combo boxes and navigation use 8-DIP corners; cards/dialogs use 16-DIP corners and clipped media frames use 12-DIP corners. Both pane headings stay centered with balanced caption-button insets. Shared brushes update without rebuilding forms. The rounded rectangular revision reached UI-ready startup in isolated System, Light and Dark profiles without an exception. The Windows App SDK desktop `ThemeSettings` notification handles contrast changes. Visual inspection remains unavailable because Computer Use did not have app access to Unity. Caption dragging, DPI changes, live appearance switching and the new layout remain manual UI acceptance checks; the earlier general UI inspection does not validate the redesigned shell.
+
+The current rounded rectangular build is published to `dist/Unity`. Its published assembly hash matches the final Release build. Quit any running Unity from its notification-area menu before launching `dist/Unity/Unity.exe` with the normal user profile.
+
+Run `scripts/test.ps1` from a normal Windows terminal with loopback socket access. A restricted execution sandbox can block local sockets; that is not a valid interoperability result. Test state uses a unique `.tools/test-state-*` directory and is removed on completion. Tests do not operate on real pairings or change OS security/privacy settings.
+
+The optional native audio probe is `dotnet tests/Unity.Tests/bin/Debug/net10.0-windows10.0.26100.0/Unity.Tests.dll --probe-audio`. It briefly reads current Windows output into memory and discards it. It is separate from the deterministic suite.
+
+The optional native display probe is the same command with `--probe-display`. It briefly displays a local marker, blanks the displays, verifies changing Windows Graphics Capture frames, tests remote input and Ctrl+Alt+Shift+U, and restores in a `finally` block. Run it on an unlocked interactive desktop; it is separate from deterministic tests. Do not run it during unrelated screen-sensitive work. No captured images are saved. Physical output switching, long-running sessions, Android gestures and acoustic latency remain device acceptance work.
+
+## Physical Android acceptance
+
+ADB reported no connected Android device during this revision's checks. No physical phone session is claimed by the automated peer. Validate these with the existing companion on a real phone:
+
+1. Verify the Windows fingerprint out of band, approve pairing, restart both apps, and check automatic reconnect. A Windows identity change must fail the saved Android pin.
+2. Exercise private-LAN and OS-bonded Bluetooth independently, then together. Drop either link during a transfer or screen/audio stream; original work must fail without replay and new work must use the remaining link.
+3. Grant only the desired Android permissions. Check battery/network, notification updates/actions/replies, SMS pagination and sent/delivery reports, audible find/stop, clipboard receipt and URL review.
+4. Send multi-chunk files in each direction, verify hashes, cancel halfway, and check that incomplete files are not published. Browse the Android-granted folder; refresh photos and download an original.
+5. Start multiple media players on both devices. Choose an exact player and check play/pause/skip/seek, independently change native volumes/mute, and confirm that received snapshots do not trigger feedback or repeated skips.
+6. Play Windows audio on Android and test silence, volume, interruptions, Wi-Fi jitter, disconnect and a late phone playback failure. Check physical latency and that stopping releases capture.
+7. Approve phone screen capture on Android and Windows desktop capture locally. Test rotation, gestures, typing, modifiers, stop, disconnect, permission revocation and unpair. Use display-off mode from either app; opening the phone viewer must precede initial blanking. Verify the phone view keeps changing and every exit restores local displays. Verify Ctrl+Alt+Shift+U and the phone display button. This mode blanks the display while the panel remains powered. Elevated-window input remains unavailable.
+8. Dial, search contacts and page history. With the optional Android Unity Phone app role, check incoming/active call actions, timer, keypad, mute and phone routes. Windows HFP call audio is an explicit unsupported feature.
+9. Close Unity to tray and check incoming traffic/alerts, reopen it, then Quit. Revoke a feature and unpair while both links are active; private live state must clear.
+
+Do not mark physical playback, telephony, Android permissions, radio throughput or capture latency as verified solely from a simulated peer.
+
+The automatic clipboard update uses Win32 clipboard change notifications and bounded Unicode reads/writes so the tray process can sync without foreground focus. Validate it on Windows with another app focused, a busy clipboard, feature disable, dual links and reconnect. This update was authored on Linux; the Windows build and native clipboard path have not been run on that host.

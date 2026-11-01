@@ -1,0 +1,67 @@
+{
+  "version": "158.0.1",
+  "url": "https://www.youtube.com/watch?v=XEzRZ35urlk",
+  "status": "partial",
+  "availability": {
+    "url": "https://www.youtube.com/watch?v=XEzRZ35urlk",
+    "title": "Google Keynote (Google I/O ‘24) - YouTube",
+    "playerId": "XEzRZ35urlk",
+    "ad": false,
+    "error": null,
+    "media": [
+      {
+        "duration": 6763.141,
+        "ready": 4,
+        "seekable": 1,
+        "time": 0
+      }
+    ]
+  },
+  "capture": {
+    "finalMedia": {
+      "seeking": true,
+      "ready": 1,
+      "networkState": 2,
+      "error": null,
+      "watchId": "XEzRZ35urlk",
+      "ad": false
+    },
+    "record": [
+      {
+        "key": "youtube:XEzRZ35urlk",
+        "kind": "video",
+        "time": 755,
+        "duration": 6763.141,
+        "rate": 1,
+        "paused": true,
+        "muted": false,
+        "volume": 1
+      }
+    ],
+    "position": 755,
+    "status": {
+      "state": "partial",
+      "results": {
+        "status": "partial",
+        "media": {
+          "status": "partial",
+          "restored": 0,
+          "attempted": 1,
+          "total": 1,
+          "reason": "Finite media only. Partial includes seeking/playback that did not finish before the deadline; unmatched identity, ads, and live streams are skipped."
+        },
+        "scroll": {
+          "status": "completed",
+          "restored": 1,
+          "cancelled": 0,
+          "total": 1,
+          "reason": "Anchors first; relative fallback is approximate. Missing infinite-scroll content is not reconstructed."
+        },
+        "forms": {
+          "status": "unsupported",
+          "reason": "No approved form values saved"
+        }
+      }
+    }
+  }
+}

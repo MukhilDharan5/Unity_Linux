@@ -38,7 +38,7 @@ PERMISSIONS = '<node><interface name="org.freedesktop.impl.portal.PermissionStor
 class PortalTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.ready = threading.Event(); cls.calls = []; cls.denied = False; cls.closed = 0; cls.devices = 3; cls.unattended = False
+        cls.ready = threading.Event(); cls.calls = []; cls.denied = False; cls.closed = 0; cls.devices = 3; cls.unattended = False; cls.source_types = 7
         def server():
             context = GLib.MainContext.new(); context.push_thread_default()
             cls.loop = GLib.MainLoop(context=context)
@@ -74,7 +74,7 @@ class PortalTests(unittest.TestCase):
             cls.session = capture.PATH + '/session/test/unity'
             def close(*args):
                 cls.closed += 1; args[-1].return_value(GLib.Variant('()', ()))
-            cls.bus.register_object(capture.PATH, Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0], method, lambda *args: GLib.Variant('u', 7 if args[-1] == 'AvailableSourceTypes' else 2), None)
+            cls.bus.register_object(capture.PATH, Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0], method, lambda *args: GLib.Variant('u', cls.source_types if args[-1] == 'AvailableSourceTypes' else 2), None)
             cls.bus.register_object(capture.PATH, Gio.DBusNodeInfo.new_for_xml(REMOTE).interfaces[0], method, None, None)
             cls.bus.register_object(capture.PATH, Gio.DBusNodeInfo.new_for_xml(REGISTRY).interfaces[0], method, None, None)
             cls.bus.register_object('/org/freedesktop/impl/portal/PermissionStore', Gio.DBusNodeInfo.new_for_xml(PERMISSIONS).interfaces[0], method, None, None)
@@ -169,14 +169,14 @@ class PortalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             instance = capture.Capture(control=True, state_dir=Path(directory))
             class Guard:
-                state = {'display_available': True, 'display_on': True, 'logical_size': [1536,864]}
+                state = {'display_available': True, 'display_on': True, 'logical_size': [1536,864], 'phone_primary': False}
                 def __init__(self, path, output): self.output = output
                 def close(self): pass
             def pipeline(description):
                 return parse('videotestsrc is-live=true ! video/x-raw,width=1920,height=1080,framerate=30/1 ! ' + description.split(' ! ', 1)[1])
             def output(fd, data): GLib.idle_add(instance.cancel); return len(data)
             try:
-                with patch.object(capture, 'output_config', side_effect=[[{'name':'eDP-1'}],[{'name':'eDP-1'},{'name':'Virtual-1'}]]), patch.object(capture, 'GuardClient', Guard), patch.object(Gst, 'parse_launch', pipeline), patch.object(os, 'write', output), patch.object(instance, 'report', reports.append):
+                with patch.object(capture, 'output_config', side_effect=[[{'name':'eDP-1'}],[{'name':'eDP-1'},{'name':'Virtual-1','enabled':True}]]), patch.object(capture, 'GuardClient', Guard), patch.object(Gst, 'parse_launch', pipeline), patch.object(os, 'write', output), patch.object(instance, 'report', reports.append):
                     instance.run()
                 self.assertEqual(instance.guard.output, 'Virtual-1')
                 self.assertEqual(instance.logical_size, [1536,864])
@@ -185,5 +185,70 @@ class PortalTests(unittest.TestCase):
                 self.assertEqual(self.calls[before], ('Register', (capture.APP_ID, {})))
             finally: instance.close(); type(self).unattended = False
 
+
+
+    def test_main_display_requests_virtual_source_without_kde_permission_and_waits_for_frames(self):
+        reports = []; before = len(self.calls); parse = Gst.parse_launch
+        baseline = [{'name':'eDP-1','type':7,'enabled':True,'currentModeId':'1',
+                     'modes':[{'id':'1','size':{'width':1920,'height':1080}}]}]
+        with tempfile.TemporaryDirectory() as directory:
+            instance = capture.Capture(control=True,state_dir=Path(directory),phone_display=True)
+            class Guard:
+                state = {'display_available':True,'display_on':True,'logical_size':[1920,1080],'phone_primary':False}
+                def __init__(self,path,output): self.output = output
+                def close(self): pass
+            def pipeline(description):
+                self.assertIn('video/x-raw,width=1920,height=1080',description)
+                return parse('videotestsrc is-live=true ! ' + description.split(' ! ',1)[1])
+            def output(fd,data):
+                GLib.idle_add(instance.cancel); return len(data)
+            try:
+                with patch.object(capture,'output_config',side_effect=[baseline,baseline+[{'name':'Meta-0','enabled':True}]]), patch.object(capture,'GuardClient',Guard), patch.object(Gst,'parse_launch',pipeline), patch.object(os,'write',output), patch.object(instance,'report',reports.append):
+                    instance.run()
+                self.assertEqual(instance.guard.output,'Meta-0')
+                selection = next(args for name,args in self.calls[before:] if name == 'SelectSources')
+                self.assertEqual(selection[-1]['types'],4)
+                self.assertFalse(any(name == 'GetPermission' for name,_ in self.calls[before:]))
+                self.assertFalse(reports[0]['display_available'])
+                self.assertTrue(any(state.get('display_available') for state in reports[1:]))
+            finally: instance.close()
+
+    def test_main_display_cannot_fall_back_to_a_physical_monitor_when_virtual_is_unsupported(self):
+        type(self).source_types = 3
+        with tempfile.TemporaryDirectory() as directory:
+            instance = capture.Capture(control=True,state_dir=Path(directory),phone_display=True)
+            before = len(self.calls)
+            try:
+                with self.assertRaisesRegex(RuntimeError,'virtual primary display'): instance.run()
+                self.assertFalse(instance.pipeline); self.assertIsNone(instance.guard)
+                self.assertFalse(any(name == 'SelectSources' for name,_ in self.calls[before:]))
+            finally: instance.close(); type(self).source_types = 7
+
+    def test_extended_display_uses_virtual_source_with_optional_phone_input_and_keeps_panel_on(self):
+        baseline=[{'name':'eDP-1','type':7,'enabled':True,'currentModeId':'1',
+                   'modes':[{'id':'1','size':{'width':1920,'height':1080}}]}]
+        parse=Gst.parse_launch
+        for control in [False,True]:
+            with self.subTest(control=control), tempfile.TemporaryDirectory() as directory:
+                reports=[]; before=len(self.calls)
+                instance=capture.Capture(control=control,state_dir=Path(directory),extended_display=True)
+                class Guard:
+                    state={'display_available':False,'display_on':True,'extended_display':True,'phone_primary':False,'logical_size':[1920,1080]}
+                    def __init__(self,path,output,extended_display=False):
+                        self.output=output; self.extended=extended_display
+                    def close(self): pass
+                def pipeline(description): return parse('videotestsrc is-live=true ! '+description.split(' ! ',1)[1])
+                def output(fd,data): GLib.idle_add(instance.cancel); return len(data)
+                try:
+                    with patch.object(capture,'output_config',side_effect=[baseline,baseline+[{'name':'Meta-0','enabled':True}]]),patch.object(capture,'GuardClient',Guard),patch.object(Gst,'parse_launch',pipeline),patch.object(os,'write',output),patch.object(instance,'report',reports.append):
+                        instance.run()
+                    self.assertTrue(instance.guard.extended)
+                    selection=next(args for name,args in self.calls[before:] if name=='SelectSources')
+                    self.assertEqual(selection[-1]['types'],4)
+                    self.assertEqual(any(name=='SelectDevices' for name,_ in self.calls[before:]),control)
+                    ready=next(state for state in reports if state.get('extended_display'))
+                    self.assertTrue(ready['display_on']); self.assertFalse(ready['phone_primary'])
+                    self.assertFalse(ready['display_available'])
+                finally: instance.close()
 
 if __name__ == '__main__': unittest.main(verbosity=2)

@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Session Continuity</title><link rel="stylesheet" href="style.css"><script type="module" src="ui.js"></script></head>
+<body class="popup"><main>
+  <header><img src="../icons/continuity.svg" width="38" height="38" alt=""><div><h1>Session Continuity</h1><p class="eyebrow">Pick up where you left off</p></div></header>
+  <div id="tracking-status" class="badge" role="status">Connecting…</div>
+  <section aria-labelledby="current-heading"><h2 id="current-heading">Current page</h2><p id="current-page" class="url">—</p><dl><div><dt>Last successful save</dt><dd id="saved-at">—</dd></div><div><dt>Media</dt><dd id="media-summary">—</dd></div><div><dt>Reading position</dt><dd id="scroll-summary">—</dd></div><div><dt>Form permission</dt><dd id="form-summary">Off by default</dd></div></dl></section>
+  <div class="button-row"><button id="save-now">Save now</button><button id="restore-last" class="secondary">Restore last active</button></div>
+  <p class="small" id="last-active">No saved active page</p>
+  <section aria-labelledby="restore-heading"><h2 id="restore-heading">Restoration</h2><p id="restore-state">Idle</p><ul id="restore-results" class="results"></ul></section>
+  <div class="button-row"><button id="toggle-tracking" class="quiet">Pause tracking</button><button id="options" class="quiet">Settings &amp; privacy</button></div>
+  <button id="grant-host" class="secondary" hidden>Allow access to this site</button>
+  <p id="notice" role="status" aria-live="polite"></p><p id="error" role="alert" class="error"></p>
+  <footer><span>Browser Local Storage</span><span id="unity-status">Unity Linux: disabled</span></footer>
+</main></body></html>

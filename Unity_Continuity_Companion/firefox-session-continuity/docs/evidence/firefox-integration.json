@@ -1,0 +1,56 @@
+{
+  "version": "158.0.1",
+  "buildID": "20261019185856",
+  "profile": "C:\\Projects\\Unity_Continuity_Companion\\firefox-session-continuity\\.test-profiles\\integration-1793113738241",
+  "temporaryInstall": true,
+  "results": [
+    {
+      "name": "Extension installs and options UI loads with Browser Local Storage",
+      "status": "passed"
+    },
+    {
+      "name": "Actual content script captures three finite players and 75% scroll",
+      "status": "passed"
+    },
+    {
+      "name": "Approved forms captured; password/OTP/payment/recovery excluded",
+      "status": "passed"
+    },
+    {
+      "name": "Duplicate URLs create independent logical records",
+      "status": "passed"
+    },
+    {
+      "name": "Background media checkpoints do not steal last-active selection",
+      "status": "passed"
+    },
+    {
+      "name": "Manual restore reuses the logically identified tab and restores components",
+      "status": "passed"
+    },
+    {
+      "name": "Repeated restoration causes no additional seeks or duplicate tabs",
+      "status": "passed"
+    },
+    {
+      "name": "Trusted user wheel input cancels pending reading restoration",
+      "status": "passed"
+    },
+    {
+      "name": "SPA navigation cannot mix routes or player identities",
+      "status": "passed"
+    },
+    {
+      "name": "Real Firefox containers keep same-URL records separate",
+      "status": "passed"
+    },
+    {
+      "name": "Form revocation purges saved values and stops subsequent captures",
+      "status": "passed"
+    },
+    {
+      "name": "Site deletion fences capture and clear-all pauses tracking",
+      "status": "passed"
+    }
+  ]
+}

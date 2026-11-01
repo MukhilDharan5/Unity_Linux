@@ -22,8 +22,8 @@ interface Feature {
 }
 abstract class Module(protected val service: CompanionService, final override val id: String) : Feature {
  protected fun granted(permission: String) = service.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
- protected fun enabled() = service.getSharedPreferences("settings", 0).getBoolean("enable.$id", !sensitive())
- private fun sensitive() = id in listOf("notifications", "notification_actions", "sms", "call_notifications", "call_control", "clipboard", "files", "photos", "browsing", "media", "audio", "remote_input", "lock", "screen")
+ protected fun enabled() = service.getSharedPreferences("settings", 0).getBoolean("enable.$id", id == "clipboard" || !sensitive())
+ private fun sensitive() = id in listOf("notifications", "notification_actions", "sms", "call_notifications", "call_control", "clipboard", "files", "photos", "browsing", "media", "audio", "remote_input", "lock", "screen", "authentication", "samsung_routines", "phone_connectivity")
  protected fun status(ok: Boolean = true, reason: String = "") = when {
   !enabled() -> cap(id, "disabled", "Enable this feature on your phone")
   !ok -> cap(id, "permission_required", reason)
@@ -107,16 +107,6 @@ class NetworkStatus(service: CompanionService) : Module(service, "network") {
  }
  override fun command(action: String, data: JSONObject): JSONObject { require(action == "refresh"); publish(); return JSONObject().put("state", "refreshed") }
 }
-class ClipboardFeature(service: CompanionService) : Module(service, "clipboard") {
- override fun capability() = status(reason = "Manual sync while Unity is visible; Android restricts background clipboard reads")
- override fun command(action: String, data: JSONObject): JSONObject {
-  require(action == "set"); val text = data.getString("text"); require(text.toByteArray().size <= 64 * 1024 - 256)
-  service.getSharedPreferences("pending", 0).edit().putString("clipboard", text).commit()
-  service.uiChanged()
-  ReceivedItems.text(service, text)
-  return JSONObject().put("state", "user_action_required").put("reason", "Tap the received text notification to open or copy it")
- }
-}
 class UrlFeature(service: CompanionService) : Module(service, "urls") {
  override fun command(action: String, data: JSONObject): JSONObject {
   require(action == "open"); val value = data.getString("url"); val uri = Uri.parse(value)
@@ -141,18 +131,6 @@ class RingerFeature(service: CompanionService) : Module(service, "ringer") {
   service.event(id, JSONObject().put("mode", mode)); JSONObject().put("state", "applied").put("mode", mode)
  }
 }
-class FindFeature(service: CompanionService) : Module(service, "find") {
- private var ringtone: Ringtone? = null
- override fun command(action: String, data: JSONObject): JSONObject = onMain {
-  when (action) {
-   "ring" -> { ringtone?.stop(); ringtone = RingtoneManager.getRingtone(service, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)); check(ringtone != null); ringtone?.play(); Handler(Looper.getMainLooper()).postDelayed({ ringtone?.stop() }, 30000) }
-   "stop" -> ringtone?.stop()
-   else -> error("Unsupported action")
-  }
-  JSONObject().put("state", if (action == "ring") "ringing" else "stopped")
- }
- fun stop() { Handler(Looper.getMainLooper()).post { ringtone?.stop() } }
-}
 class HotspotFeature(service: CompanionService) : Module(service, "hotspot") {
  override fun capability() = if (enabled()) cap(id, "user_action_required", "Phone must approve tethering; no silent activation or Wi-Fi Direct assumption") else status()
  override fun command(action: String, data: JSONObject): JSONObject {
@@ -168,25 +146,38 @@ class FeatureRegistry(val service: CompanionService) {
  val files = FileFeature(service)
  val find = FindFeature(service)
  val media = MediaFeature(service)
+ val desktopMedia = DesktopMediaFeature(service)
+ val sound = SoundFeature(service)
+ val authentication = PhoneAuthentication(service)
  val audio = AudioRouting(service)
  val lock = DeviceLock(service)
  val screen = ScreenSharing(service)
  val sms = SmsFeature(service)
+ val clipboard = ClipboardFeature(service)
+ val phoneConnectivity = PhoneConnectivity(service)
  val modules: Map<String, Feature> = listOf(
   LocalFeature(service, "pairing"), LocalFeature(service, "reconnect"), battery, network,
   object : Module(service, "connectivity") { override fun capability() = cap(id, reason = "Pinned TLS over simultaneous Bluetooth and Wi-Fi / LAN connections") },
   NotificationFeature(service), NotificationActions(service), sms, calls,
   callControl,
-  ClipboardFeature(service), files, PhotoFeature(service), UrlFeature(service), BrowseFeature(service), media, audio, lock, screen,
+  clipboard, files, PhotoFeature(service), UrlFeature(service), BrowseFeature(service), media, desktopMedia, sound, audio, lock, screen, authentication,
+  object : Module(service, "media_artwork") { override fun capability() = if (desktopMedia.capability().optString("status")=="available") cap(id, reason="Track-scoped 1024-pixel cover updates") else cap(id,"disabled","Enable media controls") },
   RingerFeature(service), find, RemoteInputFeature(service),
-  HotspotFeature(service)
+  HotspotFeature(service), SamsungRoutines(service), phoneConnectivity
  ).associateBy { it.id }
  fun capabilities() = JSONArray(modules.values.map { it.capability() })
  fun publish() {
-  audio.settingsChanged(); screen.settingsChanged()
+  authentication.settingsChanged(); audio.settingsChanged(); screen.settingsChanged(); find.settingsChanged(); sound.watch(); clipboard.watch()
+  phoneConnectivity.watch()
+  if (desktopMedia.capability().getString("status")!="available") desktopMedia.clear()
   if (!service.connection.ready) return
   service.connection.send(JSONObject().put("type", "capabilities").put("capabilities", capabilities()))
-  battery.publish(); battery.watch(); network.watch(); network.publish(); media.watch(); sms.watch(); callControl.publish(); PhoneNotifications.instance?.publishAll()
+  // A temporary permission, media-service or queue failure cannot tear down
+  // an authenticated connection or prevent the other features refreshing.
+  listOf<() -> Unit>({ battery.publish(); battery.watch() }, { network.watch(); network.publish() },
+   { media.watch() }, { sms.watch() }, { callControl.publish() }, { PhoneNotifications.instance?.publishAll() }).forEach { publish ->
+   runCatching(publish).onFailure { android.util.Log.w("Unity", "A feature could not refresh; connection retained") }
+  }
  }
- fun disconnected() { battery.stop(); audio.stop(); screen.stop(); files.abortAll(); find.stop(); media.stop(); sms.stop(); network.stop() }
+ fun disconnected() { battery.stop(); audio.stop(); screen.stop(); files.abortAll(); find.stop(); media.stop(); desktopMedia.clear(); sound.stop(); sms.stop(); network.stop(); clipboard.disconnected(); phoneConnectivity.stop() }
 }

@@ -73,6 +73,8 @@ class BluetoothStreams:
         return self.bluez.open(AUDIO if kind == 'audio' else SCREEN)
 
 class BluetoothAudio(BluetoothStreams, audio_tests.AudioIntegration):
+    audio_transport = "bluetooth"
+    pcm_bytes = 320
     def check_transport_disconnect(self):
         stream, _ = self.start_route()
         self.bluez.disconnect(AUDIO)

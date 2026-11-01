@@ -11,4 +11,5 @@
  <color name="unity_button">#EBEDF0</color>
  <color name="unity_success">#187543</color>
  <color name="unity_success_soft">#E2F3E9</color>
+ <color name="unity_destructive">#C01C28</color>
 </resources>

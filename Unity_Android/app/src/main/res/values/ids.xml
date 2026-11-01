@@ -1,4 +1,14 @@
 <resources>
+ <item type="id" name="phone_number"/>
+ <item type="id" name="phone_delete"/>
+ <item type="id" name="phone_call"/>
+ <item type="id" name="authentication_request"/>
+ <item type="id" name="authentication_approve"/>
+ <item type="id" name="authentication_decline"/>
+ <item type="id" name="authentication_export"/>
+ <item type="id" name="authentication_reset"/>
+ <item type="id" name="authentication_credential"/>
+ <item type="id" name="open_authentication"/>
  <item name="feature_audio" type="id"/>
  <item type="id" name="unity_root"/>
  <item type="id" name="page_overview"/>
@@ -42,4 +52,24 @@
  <item name="screen_keyboard_toggle" type="id" />
  <item name="screen_display_toggle" type="id" />
  <item name="view_computer_display_off" type="id" />
+ <item type="id" name="open_media_players"/>
+ <item type="id" name="media_player_picker"/>
+ <item type="id" name="media_track_title"/>
+ <item type="id" name="media_seek"/>
+ <item type="id" name="media_previous"/>
+ <item type="id" name="media_play"/>
+ <item type="id" name="media_next"/>
+ <item type="id" name="laptop_volume"/>
+ <item type="id" name="laptop_mute"/>
+ <item type="id" name="phone_volume"/>
+ <item type="id" name="phone_mute"/>
+ <item name="screen_orientation_toggle" type="id" />
+ <item name="view_computer_extended_display" type="id" />
+ <item name="network_privacy" type="id" />
+ <item name="feature_authentication" type="id" />
+ <item name="feature_samsung_routines" type="id" />
+ <item name="setup_samsung_routines" type="id" />
+ <item name="feature_phone_connectivity" type="id" />
+ <item name="phone_bluetooth_permission" type="id" />
+ <item name="phone_bluetooth_devices" type="id" />
 </resources>

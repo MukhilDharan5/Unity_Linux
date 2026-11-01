@@ -38,7 +38,8 @@ def wait_for(predicate, timeout=5):
 
 
 class Peer:
-    def __init__(self, port, fingerprint, secret=None, stream=None):
+    def __init__(self, port, fingerprint, secret=None, stream=None, network_info=False, automatic_clipboard=True):
+        self.automatic_clipboard = automatic_clipboard
         # A test-only pin verifier; production Android verifies in X509TrustManager before application data.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
@@ -47,7 +48,7 @@ class Peer:
         self.sock = context.wrap_socket(stream if stream is not None else socket.create_connection(('127.0.0.1', port)), server_hostname='unity.local')
         self.sock.settimeout(5)
         assert hashlib.sha256(self.sock.getpeercert(binary_form=True)).hexdigest() == fingerprint
-        self.send({'type': 'hello', 'version': 1, 'device_id': DEVICE, 'name': 'Integration peer', 'capabilities': CAPS})
+        self.send({'type': 'hello', 'version': 1, 'device_id': DEVICE, 'name': 'Integration peer', 'capabilities': CAPS, 'network_info': network_info})
         reply = self.read()
         self.pending = reply['type'] == 'pair_pending'
         if not self.pending:
@@ -71,8 +72,13 @@ class Peer:
         return value
 
     def read(self):
-        size, = struct.unpack('>I', self.exact(4))
-        return json.loads(self.exact(size))
+        while True:
+            size, = struct.unpack('>I', self.exact(4))
+            message = json.loads(self.exact(size))
+            if self.automatic_clipboard and message.get('type') == 'command' and message.get('feature') == 'clipboard' and message.get('data', {}).get('automatic') is True:
+                self.send({'type': 'result', 'id': message['id'], 'ok': True, 'data': {'state': 'applied'}, 'error': ''})
+                continue
+            return message
 
     def event(self, feature, data):
         self.send({'type': 'event', 'feature': feature, 'data': data})
@@ -107,7 +113,8 @@ class Integration(unittest.TestCase):
     @classmethod
     def start_daemon(cls):
         cls.log = open(cls.dir / 'daemon.log', 'a')
-        cls.daemon = subprocess.Popen([cls.bin / 'unityd', '--state-dir', cls.state, '--bind', '127.0.0.1', '--port', str(cls.port)], stdout=cls.log, stderr=cls.log)
+        environment = dict(os.environ, WAYLAND_DISPLAY=str(cls.dir / 'no-wayland-display'), DISPLAY='')
+        cls.daemon = subprocess.Popen([cls.bin / 'unityd', '--state-dir', cls.state, '--bind', '127.0.0.1', '--port', str(cls.port)], stdout=cls.log, stderr=cls.log, env=environment)
         # Probing unityctl before the test daemon owns its name would activate
         # a separately installed production service on this otherwise private bus.
         probe = Gio.DBusConnection.new_for_address_sync(os.environ['DBUS_SESSION_BUS_ADDRESS'],
@@ -161,7 +168,7 @@ class Integration(unittest.TestCase):
         path = '/org/unityconnect/devices/d_' + DEVICE
         wait_for(lambda: 'connected' in self.cli('list').stdout)
         caps = json.loads(self.cli('capabilities', DEVICE).stdout)
-        self.assertEqual(len(caps), 23)
+        self.assertEqual(len(caps), 28)
         for feature in ('call_control',):
             self.assertEqual(next(c for c in caps if c['id'] == feature)['status'], 'available')
         # Private phone state is blocked before an explicit client grant.

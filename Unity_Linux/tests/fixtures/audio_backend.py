@@ -7,11 +7,24 @@ import sys
 import time
 
 state_file = Path(os.environ['UNITY_TEST_AUDIO_STATE'])
+if Path(sys.argv[0]).name == 'pacat':
+    if state_file.with_suffix('.fail-playback').exists():
+        sys.exit(1)
+    with state_file.with_suffix('.played').open('ab', buffering=0) as output:
+        while True:
+            block = os.read(sys.stdin.fileno(), 4096)
+            if not block:
+                sys.exit(0)
+            output.write(block)
+
 if Path(sys.argv[0]).name == 'parec':
     if state_file.with_suffix('.fail-capture').exists():
         sys.exit(1)
     # Deterministic stereo PCM, one packet per 10 ms.
-    pcm = bytes(range(256)) * 7 + bytes(range(128))
+    rate = int(next(arg.split('=')[1] for arg in sys.argv if arg.startswith('--rate=')))
+    channels = int(next(arg.split('=')[1] for arg in sys.argv if arg.startswith('--channels=')))
+    size = rate // 100 * channels * 2
+    pcm = (bytes(range(256)) * ((size + 255) // 256))[:size]
     while True:
         sys.stdout.buffer.write(pcm); sys.stdout.buffer.flush(); time.sleep(.01)
 

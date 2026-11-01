@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Stage or install daemon, CLI, and GTK separately. Does not start/stop services."""
 import argparse
+import json
 import os
 from pathlib import Path
 import shutil
@@ -12,6 +13,7 @@ p.add_argument('--prefix', type=Path, default=Path.home() / '.local')
 p.add_argument('--destdir', type=Path)
 p.add_argument('--component', choices=['all', 'daemon', 'gtk'], default='all')
 p.add_argument('--debug', action='store_true', help='Install debug binaries for developer validation')
+p.add_argument('--firefox-manifest-dir', type=Path, help='Override Firefox native host registration directory (for sandboxed Firefox or packaging)')
 a = p.parse_args()
 prefix = a.prefix.absolute()
 if any(c in str(prefix) for c in '\n\r\t"\\'):
@@ -38,9 +40,20 @@ def text(dst, value, mode=0o644):
 if a.component in ('all', 'daemon'):
     for name in ('unityd', 'unityctl'):
         copy(root / 'target' / ('debug' if a.debug else 'release') / name, libexec / name, 0o755)
+    copy(root / 'unity-firefox/firefox-host.py', libexec / 'firefox-host.py', 0o755)
+    manifest_dir = a.firefox_manifest_dir or (Path('/usr/lib/mozilla/native-messaging-hosts')
+        if prefix in (Path('/usr'), Path('/usr/local')) else Path.home() / '.mozilla/native-messaging-hosts')
+    text(manifest_dir / 'org.unityconnect.firefox.json', json.dumps({
+        'name': 'org.unityconnect.firefox', 'description': 'Unity Linux Firefox companion',
+        'path': str(libexec / 'firefox-host.py'), 'type': 'stdio',
+        'allowed_extensions': ['session-continuity@local.invalid'],
+    }, indent=2) + '\n')
+    copy(root / 'unity-media/thumbnail.py', libexec / 'media-thumbnail.py', 0o644)
     copy(root / 'unity-screen/screen-capture.py', libexec / 'screen-capture.py', 0o644)
     copy(root / 'unity-screen/display-guard.py', libexec / 'display-guard.py', 0o644)
     copy(root / 'scripts/setup-screen-sharing.py', libexec / 'setup-screen-sharing.py', 0o644)
+    copy(root / 'scripts/setup-phone-auth.py', libexec / 'setup-phone-auth.py', 0o644)
+    copy(root / 'target' / ('debug' if a.debug else 'release') / 'libpam_unity.so', libexec / 'pam_unity.so', 0o644)
     text(prefix / 'share/applications/org.unityconnect.Unity.Screen.desktop',
          (root / 'packaging/org.unityconnect.Unity.Screen.desktop').read_text().replace('@LIBEXEC@', str(libexec)))
     bindir = stage(prefix / 'bin'); bindir.mkdir(parents=True, exist_ok=True)
@@ -62,6 +75,7 @@ if a.component in ('all', 'gtk'):
     text(prefix / 'bin/unity-gtk', '#!/usr/bin/env python3\nimport os\nos.execv(' + repr(str(libexec / 'unityctl')) + ', ["unityctl", "launch-gtk"])\n', 0o755)
     copy(root / 'packaging/org.unityconnect.Unity.desktop', prefix / 'share/applications/org.unityconnect.Unity.desktop', 0o644)
     copy(root / 'packaging/icons/org.unityconnect.Unity.svg', prefix / 'share/icons/hicolor/scalable/apps/org.unityconnect.Unity.svg', 0o644)
+    copy(root / 'packaging/icons/org.unityconnect.Unity-symbolic.svg', prefix / 'share/icons/hicolor/symbolic/apps/org.unityconnect.Unity-symbolic.svg', 0o644)
 for doc in (root / 'docs').glob('*.md'):
     copy(doc, prefix / 'share/doc/unity' / doc.name, 0o644)
 for xml in (root / 'docs/api').glob('*.xml'):

@@ -67,7 +67,7 @@ class CompanionUiTest {
   val activity = open()
   assertEquals("Not connected", activity.findViewById<TextView>(R.id.connection_title).text.toString())
   assertFalse(activity.findViewById<View>(R.id.send_file_button).isEnabled)
-  assertFalse(activity.findViewById<View>(R.id.send_clipboard_button).isEnabled)
+  assertNull(activity.findViewById<View>(R.id.send_clipboard_button))
   assertFalse(activity.findViewById<View>(R.id.received_url_button).isEnabled)
   assertFalse(activity.findViewById<Switch>(R.id.feature_notifications).isChecked)
   assertFalse(activity.findViewById<Switch>(R.id.feature_audio).isChecked)
@@ -76,6 +76,7 @@ class CompanionUiTest {
   assertFalse(activity.findViewById<View>(R.id.lock_computer_button).isEnabled)
   assertFalse(activity.findViewById<View>(R.id.share_phone_screen).isEnabled)
   assertFalse(activity.findViewById<View>(R.id.view_computer_screen).isEnabled)
+  assertFalse(activity.findViewById<View>(R.id.view_computer_extended_display).isEnabled)
   listOf("overview" to R.id.nav_overview, "sharing" to R.id.nav_sharing, "features" to R.id.nav_features, "settings" to R.id.nav_settings).forEach { (name, id) ->
    activity.findViewById<View>(id).performClick(); capture(activity, "$name-light")
    assertTrue(activity.findViewById<View>(id).isSelected)
@@ -228,13 +229,12 @@ class CompanionUiTest {
   row.performClick()
   assertEquals(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS, shadowOf(activity).nextStartedActivity.action)
  }
- @Test fun pendingClipboardChangesArriveWithoutPollingAndCanBeAppliedOffline() {
+ @Test fun legacyPendingClipboardIsAppliedAutomaticallyOffline() {
   val activity = open()
   val pending = activity.getSharedPreferences("pending", Context.MODE_PRIVATE)
   pending.edit().putString("clipboard", "Explicit test text").commit()
   shadowOf(Looper.getMainLooper()).idle()
-  val apply = activity.findViewById<View>(R.id.received_clipboard_button)
-  assertTrue(apply.isEnabled); apply.performClick()
+  assertFalse(activity.findViewById<View>(R.id.received_clipboard_button).isClickable)
   assertFalse(pending.contains("clipboard"))
   val clipboard = activity.getSystemService(android.content.ClipboardManager::class.java)
   assertEquals("Explicit test text", clipboard.primaryClip!!.getItemAt(0).text.toString())

@@ -1,0 +1,30 @@
+{
+  "recordedDate": "2026-10-27",
+  "timezone": "Asia/Calcutta",
+  "description": "Summary recorded from successful command outputs. Browser-specific reports are saved separately by the test runners.",
+  "nodeVersion": "24.22.1",
+  "unitTests": {
+    "command": "node --test tests/*.test.mjs",
+    "passed": 55,
+    "failed": 0,
+    "skipped": 0
+  },
+  "extensionLint": {
+    "tool": "web-ext 10.8.0",
+    "command": "node node_modules/web-ext/bin/web-ext.js lint --source-dir extension --warnings-as-errors --no-config-discovery",
+    "errors": 0,
+    "warnings": 0,
+    "notices": 0,
+    "nonValidationNote": "The update notifier could not write its user-cache configuration; extension validation succeeded."
+  },
+  "ui": {
+    "command": "node tests/firefox/ui.mjs",
+    "browser": "Firefox 158.0.1",
+    "optionsInputsHaveLabels": true,
+    "optionsHorizontalOverflow": false,
+    "popupBodyWidth": 390,
+    "popupHorizontalOverflow": false,
+    "screenshotsVisuallyInspected": true,
+    "nativeToolbarPanelInspected": false
+  }
+}

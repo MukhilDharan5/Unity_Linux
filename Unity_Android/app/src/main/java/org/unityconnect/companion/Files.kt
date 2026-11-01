@@ -85,14 +85,15 @@ class FileFeature(service: CompanionService) : Module(service, "files") {
  }
  @Synchronized fun abort(id: String) { incoming.remove(id)?.let { runCatching { it.stream.close(); it.file.delete() } } }
  @Synchronized fun abortAll() { incoming.values.forEach { runCatching { it.stream.close(); it.file.delete() } }; incoming.clear() }
- fun send(uri: Uri): JSONObject {
+ fun send(uri: Uri, transferId: String? = null): JSONObject {
   check(capability().getString("status") == "available") { "Enable file sharing on phone" }
   val resolver = service.contentResolver
   var name = uri.lastPathSegment?.substringAfterLast('/') ?: "shared-file"
   resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { if (it.moveToFirst()) name = it.getString(0) ?: name }
   require(Protocol.safeName(name)) { "Rename this file before sending" }
   val snapshot = File.createTempFile("unity-send-", ".part", service.cacheDir)
-  val transfer = UUID.randomUUID().toString().replace("-", "")
+  val transfer = transferId ?: UUID.randomUUID().toString().replace("-", "")
+  require(Protocol.validId(transfer))
   var began = false
   var transferSender: ((JSONObject) -> Unit)? = null
   try {
@@ -105,7 +106,7 @@ class FileFeature(service: CompanionService) : Module(service, "files") {
      output.write(buffer, 0, n); hash.update(buffer, 0, n)
     }
    } } ?: error("File unavailable")
-   val send = service.connection.fileSender()
+   val send = service.connection.fileSender(transferId)
    transferSender = send
    send(JSONObject().put("phase", "begin").put("id", transfer).put("name", name).put("size", size).put("sha256", Protocol.hex(hash.digest())))
    began = true
@@ -122,37 +123,52 @@ class FileFeature(service: CompanionService) : Module(service, "files") {
 }
 class PhotoFeature(service: CompanionService) : Module(service, "photos") {
  private val visible = ConcurrentHashMap<String, Uri>()
- override fun capability(): JSONObject {
-  val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
-  val allowed = granted(permission) || (Build.VERSION.SDK_INT >= 34 && granted(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED))
-  return status(allowed && service.getSharedPreferences("settings", 0).getBoolean("enable.files", false), "Grant selected photo access and enable file transfer on phone")
+ private fun allowed(video: Boolean): Boolean {
+  val permission = if (Build.VERSION.SDK_INT >= 33) {
+   if (video) Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_MEDIA_IMAGES
+  } else Manifest.permission.READ_EXTERNAL_STORAGE
+  return granted(permission) || (Build.VERSION.SDK_INT >= 34 && granted(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED))
  }
+ override fun capability() = status((allowed(false) || allowed(true)) && service.getSharedPreferences("settings", 0).getBoolean("enable.files", false),
+  "Grant photo/video access and enable file transfer on phone")
  override fun command(action: String, data: JSONObject): JSONObject {
   when (action) {
    "list" -> {
-    val items = JSONArray(); visible.clear()
-    service.contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-      arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME, MediaStore.Images.Media.SIZE,
-       MediaStore.Images.Media.DATE_ADDED, MediaStore.Images.Media.WIDTH, MediaStore.Images.Media.HEIGHT),
-      null, null, "${MediaStore.Images.Media.DATE_ADDED} DESC")?.use { c ->
-     while (c.moveToNext() && items.length() < 30) {
-      val token = UUID.randomUUID().toString().replace("-", "")
-      visible[token] = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0))
-      items.put(JSONObject().put("id", token).put("name", Protocol.text(c.getString(1) ?: "Photo", 255)).put("size", c.getLong(2))
-       .put("timestamp", c.getLong(3) * 1000).put("width", c.getInt(4)).put("height", c.getInt(5)))
-     }
+    val candidates = mutableListOf<Pair<JSONObject, Uri>>()
+    for ((video, collection) in listOf(false to MediaStore.Images.Media.EXTERNAL_CONTENT_URI, true to MediaStore.Video.Media.EXTERNAL_CONTENT_URI)) {
+     if (!allowed(video)) continue
+     val columns = mutableListOf("_id", "_display_name", "_size", "date_added", "width", "height", "mime_type")
+     if (video) columns.add("duration")
+     try { service.contentResolver.query(collection, columns.toTypedArray(), null, null, "date_added DESC")?.use { c ->
+      var count = 0
+      while (c.moveToNext() && count++ < 60) {
+       val uri = ContentUris.withAppendedId(collection, c.getLong(0))
+       val item = JSONObject().put("name", Protocol.text(c.getString(1) ?: if (video) "Video" else "Photo", 255))
+        .put("size", c.getLong(2).coerceAtLeast(0)).put("timestamp", c.getLong(3) * 1000)
+        .put("width", c.getInt(4)).put("height", c.getInt(5)).put("kind", if (video) "video" else "image")
+        .put("mime", c.getString(6) ?: if (video) "video/mp4" else "image/jpeg")
+       if (video) item.put("duration", c.getLong(7).coerceAtLeast(0))
+       candidates.add(item to uri)
+      }
+     } } catch (_: SecurityException) { /* A per-type permission may have just changed. */ }
     }
-    return JSONObject().put("items", items).put("preview_supported", true)
+    val items = JSONArray(); visible.clear()
+    for ((item, uri) in candidates.sortedByDescending { it.first.optLong("timestamp") }.take(60)) {
+     val token = UUID.randomUUID().toString().replace("-", "")
+     visible[token] = uri; items.put(item.put("id", token))
+    }
+    return JSONObject().put("items", items).put("preview_supported", true).put("video_supported", true).put("clipboard_supported", true)
    }
    "preview" -> {
     val token = data.getString("id"); val edge = data.optInt("edge", 256)
     require(Protocol.validId(token) && edge in 64..320)
-    val uri = visible[token] ?: error("Photo selection expired; refresh the list")
+    val uri = visible[token] ?: error("Gallery selection expired; refresh the list")
     val thumbnail = service.contentResolver.loadThumbnail(uri, Size(edge, edge), null)
     try { return JSONObject().put("id", token).put("preview", ImagePreview.encode(thumbnail, edge)) }
     finally { thumbnail.recycle() }
    }
-   "get" -> return service.features.files.send(visible[data.getString("id")] ?: error("Photo selection expired; refresh the list"))
+   "get" -> return service.features.files.send(visible[data.getString("id")] ?: error("Gallery selection expired; refresh the list"),
+    data.optString("transfer_id").ifEmpty { null })
    else -> error("Unsupported action")
   }
  }

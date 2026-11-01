@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.net.Network
 import java.io.Closeable
 import java.io.InputStream
 import java.io.OutputStream
@@ -37,16 +38,20 @@ internal class SecureChannel(val inputStream: InputStream, val outputStream: Out
  override fun close() { isClosed = true; transport.close() }
 }
 internal data class TlsEndpoint(val host: String, val port: Int, val context: SSLContext,
- val bluetoothAddress: String = "", val android: Context? = null) {
+ val bluetoothAddress: String = "", val android: Context? = null,
+ val network: Network? = null, val connectTimeoutMs: Int = 10000, val localAddress: java.net.InetAddress? = null) {
  val bluetooth get() = bluetoothAddress.isNotEmpty()
  fun open(kind: StreamKind, readTimeout: Int, onOpening: (Closeable) -> Unit): SecureChannel {
   if (!bluetooth) {
    val raw = Socket(); onOpening(raw)
    try {
-    raw.tcpNoDelay = true; raw.sendBufferSize = if (kind == StreamKind.AUDIO) 4096 else 65536
-    raw.connect(InetSocketAddress(host, port), 10000)
+    raw.tcpNoDelay = true; raw.keepAlive = true; raw.sendBufferSize = if (kind == StreamKind.AUDIO) 4096 else 65536
+    network?.bindSocket(raw)
+    if (network==null && localAddress!=null) raw.bind(InetSocketAddress(localAddress,0))
+    val address = network?.getAllByName(host)?.firstOrNull()?.let { InetSocketAddress(it,port) } ?: InetSocketAddress(host,port)
+    raw.connect(address, connectTimeoutMs)
     val tls = context.socketFactory.createSocket(raw, host, port, true) as SSLSocket; onOpening(tls)
-    tls.enabledProtocols = arrayOf("TLSv1.3"); tls.soTimeout = 20000; tls.startHandshake(); tls.soTimeout = readTimeout
+    tls.enabledProtocols = arrayOf("TLSv1.3"); tls.soTimeout = maxOf(4000, connectTimeoutMs); tls.startHandshake(); tls.soTimeout = readTimeout
     return SecureChannel(tls.inputStream, tls.outputStream, tls) { tls.soTimeout = it }
    } catch (e: Exception) { raw.close(); throw e }
   }

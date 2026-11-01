@@ -227,7 +227,31 @@ impl Manager {
     }
     async fn pairing_info(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
         self.access.require(&h, "control").await?;
-        Ok(json!({"fingerprint":self.engine.identity.fingerprint,"port":self.engine.port,"pending":self.engine.pending_pairs().await,"bluetooth":self.engine.bluetooth_info().await}).to_string())
+        Ok(json!({"fingerprint":self.engine.identity.fingerprint,"port":self.engine.port,"pending":self.engine.pending_pairs().await,"bluetooth":self.engine.bluetooth_info().await,"network":self.engine.network_info().await}).to_string())
+    }
+    async fn firefox_status(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
+        self.access.require(&h, "read").await?;
+        Ok(self.engine.firefox_status().await.to_string())
+    }
+    async fn set_firefox_enabled(
+        &self,
+        enabled: bool,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<(), Error> {
+        self.access.require(&h, "control").await?;
+        self.engine.set_firefox_enabled(enabled).await.map_err(err)
+    }
+    async fn restore_firefox_context(
+        &self,
+        profile_id: &str,
+        context_id: &str,
+        #[zbus(header)] h: Header<'_>,
+    ) -> Result<String, Error> {
+        self.access.require(&h, "control").await?;
+        self.engine
+            .restore_firefox_context(profile_id, context_id)
+            .await
+            .map_err(err)
     }
     async fn approve_pairing(
         &self,
@@ -322,7 +346,7 @@ impl Manager {
     async fn diagnostics(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
         self.access.require(&h, "read").await?;
         let devices = self.engine.devices().await;
-        Ok(json!({"api_version":1,"protocol_version":1,"devices":devices.iter().map(|d|json!({"id":d.id,"connected":d.connected,"last_error":d.last_error})).collect::<Vec<_>>(),"bluetooth":self.engine.bluetooth_info().await,"lan":"TLS with certificate pinning and device challenge authentication","pairing":"explicit 120-second maximum window"}).to_string())
+        Ok(json!({"api_version":1,"protocol_version":1,"devices":devices.iter().map(|d|json!({"id":d.id,"connected":d.connected,"last_error":d.last_error})).collect::<Vec<_>>(),"bluetooth":self.engine.bluetooth_info().await,"lan":"TLS 1.3 with certificate pinning and device challenge authentication","network":self.engine.network_info().await,"pairing":"explicit 120-second maximum window"}).to_string())
     }
     async fn list_operations(&self, #[zbus(header)] h: Header<'_>) -> Result<String, Error> {
         let owner = self.access.require(&h, "read").await?;

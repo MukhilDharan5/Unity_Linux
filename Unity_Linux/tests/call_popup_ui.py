@@ -53,9 +53,15 @@ def button(widget, title):
     return next(w for w in widgets(widget) if isinstance(w, Gtk.Button) and w.get_label() == title)
 
 def capture(window, name):
+    window.get_child().allocate(window.get_width(), window.get_height(), -1, None)
     paintable = Gtk.WidgetPaintable.new(window); snapshot = Gtk.Snapshot()
     paintable.snapshot(snapshot, window.get_width(), window.get_height())
-    texture = window.get_renderer().render_texture(snapshot.to_node(), Graphene.Rect().init(0, 0, window.get_width(), window.get_height()))
+    node = snapshot.to_node()
+    if node is None:
+        # A covered GNOME window or Broadway may have no native frame cache.
+        snapshot = Gtk.Snapshot(); window.snapshot_child(window.get_child(), snapshot); node = snapshot.to_node()
+    assert node is not None, 'Call controls did not render'
+    texture = window.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, window.get_width(), window.get_height()))
     output = Path('/tmp') / name; texture.save_to_png(str(output)); print(output, flush=True)
 
 class App(module.App):
@@ -133,6 +139,14 @@ def checks():
     yield
     capture(win.call_popup, 'unity-call-popup-active.png')
     win.nav.select_row(win.pages['calls']); yield
+    # Completion/state renders must not perpetually request audio_devices and
+    # fill the history, which would also block laptop audio start/stop controls.
+    count = sum(action == 'audio_devices' for action, _ in win.client.commands)
+    for _ in range(5):
+        win.load_visible(); yield
+    assert sum(action == 'audio_devices' for action, _ in win.client.commands) == count
+    win.refresh_call_audio_devices(); yield
+    assert sum(action == 'audio_devices' for action, _ in win.client.commands) == count + 1
     capture(win, 'unity-call-page-active.png')
     button(popup, 'Hold').emit('clicked'); yield
     assert ('hold', {'call_id': call['id']}) in win.client.commands

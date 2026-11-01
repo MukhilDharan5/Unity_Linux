@@ -13,7 +13,8 @@ object ImagePreview {
   val scale = minOf(1.0, edge.toDouble() / maxOf(width, height))
   return maxOf(1, (width * scale).roundToInt()) to maxOf(1, (height * scale).roundToInt())
  }
- fun encode(source: Bitmap, edge: Int = 256): JSONObject {
+ fun encode(source: Bitmap, edge: Int = 256, maxBytes: Int = MAX_BYTES): JSONObject {
+  require(maxBytes in 1024..MAX_BYTES)
   val (width, height) = fitSize(source.width, source.height, edge)
   val scaled = Bitmap.createScaledBitmap(source, width, height, true)
   try {
@@ -21,9 +22,10 @@ object ImagePreview {
     val output = ByteArrayOutputStream()
     check(scaled.compress(Bitmap.CompressFormat.JPEG, quality, output))
     val bytes = output.toByteArray()
-    if (bytes.size <= MAX_BYTES) return JSONObject().put("mime", "image/jpeg").put("width", width)
+    if (bytes.size <= maxBytes) return JSONObject().put("mime", "image/jpeg").put("width", width)
      .put("height", height).put("data", Base64.encodeToString(bytes, Base64.NO_WRAP))
    }
+   if (edge > 64 && maxBytes < MAX_BYTES) return encode(source, 64, maxBytes)
    error("Image could not fit preview budget")
   } finally { if (scaled !== source) scaled.recycle() }
  }

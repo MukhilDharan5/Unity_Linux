@@ -6,11 +6,11 @@ impl Plugin for Feature {
     fn spec(&self) -> Spec {
         Spec {
             id: "photos",
-            title: "Recent photos",
+            title: "Photos and videos",
             group: "sharing",
             sensitive: true,
             blocked: "",
-            actions: &["list", "get", "preview"],
+            actions: &["list", "get", "copy", "preview"],
         }
     }
     fn command(&self, action: &str, data: &Value) -> Result<()> {

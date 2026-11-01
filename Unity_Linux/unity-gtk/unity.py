@@ -10,6 +10,7 @@ import signal
 import stat
 import sys
 import time
+import weakref
 import gi
 
 gi.require_version('Gtk', '4.0')
@@ -20,11 +21,92 @@ BUS = 'org.unityconnect'
 ROOT = '/org/unityconnect/Manager'
 MAX_FILE = 64 * 1024 * 1024
 
+
+class GalleryDragProvider(Gdk.ContentProvider):
+    """Materialize the verified original asynchronously before supplying a file URI."""
+    def __init__(self, window, key):
+        super().__init__()
+        self.window = weakref.ref(window)
+        self.key, self.device, self.generation = key, window.path, window.generation
+        self.payload, self.failure, self.waiters = None, None, []
+        self.deadline = time.monotonic() + 65
+        self.timer = GLib.timeout_add(200, self.check)
+        window.photo_status.set_label('Preparing the original file for dragging…')
+        window.execute('photos', 'get', {'id': key}, done=self.downloaded, quiet=True)
+
+    def do_ref_formats(self):
+        return Gdk.ContentFormats.new(['text/uri-list'])
+
+    def do_ref_storable_formats(self):
+        return self.do_ref_formats()
+
+    def valid(self):
+        window = self.window()
+        return bool(window and window.path == self.device and window.generation == self.generation
+                    and self.key in window.photo_items and window.enabled('photos') and window.enabled('files'))
+
+    def check(self):
+        if not self.valid():
+            self.finish(error='The phone connection or gallery permission changed.')
+        elif time.monotonic() >= self.deadline:
+            self.finish(error='The original file could not be downloaded in time. Try dragging it again.')
+        return self.payload is None and self.failure is None
+
+    def downloaded(self, result):
+        if self.payload is not None or self.failure is not None:
+            return
+        path = result.get('received_path') if result and self.valid() else None
+        try:
+            if not path or not Path(path).is_absolute() or not Path(path).is_file():
+                raise ValueError('Could not download the original file. Check the phone connection and try again.')
+            self.finish(payload=(Gio.File.new_for_path(path).get_uri() + '\r\n').encode('utf-8'))
+        except (OSError, ValueError) as error:
+            self.finish(error=str(error))
+
+    def finish(self, payload=None, error=None):
+        if self.payload is not None or self.failure is not None:
+            return
+        self.payload, self.failure = payload, error
+        if self.timer:
+            GLib.source_remove(self.timer); self.timer = None
+        window = self.window()
+        if window and window.path == self.device and window.generation == self.generation:
+            window.photo_status.set_label(error or 'Original file ready. Drop it to copy it into another app or folder.')
+        for task, stream, priority, cancellable in self.waiters:
+            self.write(task, stream, priority, cancellable)
+        self.waiters.clear()
+
+    def write(self, task, stream, priority, cancellable):
+        if task.return_error_if_cancelled():
+            return
+        if self.failure or not self.valid():
+            task.return_error(GLib.Error.new_literal(Gio.io_error_quark(), self.failure or 'Gallery access ended.', Gio.IOErrorEnum.FAILED))
+            return
+        def written(output, result):
+            try:
+                output.write_all_finish(result); task.return_boolean(True)
+            except GLib.Error as error:
+                task.return_error(error)
+        stream.write_all_async(self.payload, priority, cancellable, written)
+
+    def do_write_mime_type_async(self, mime, stream, priority, cancellable, callback, user_data):
+        task = Gio.Task.new(self, cancellable, callback, user_data)
+        task.set_priority(priority)
+        if mime != 'text/uri-list':
+            task.return_error(GLib.Error.new_literal(Gio.io_error_quark(), 'Unsupported drag format', Gio.IOErrorEnum.NOT_SUPPORTED))
+        elif self.payload is not None or self.failure is not None:
+            self.write(task, stream, priority, cancellable)
+        else:
+            self.waiters.append((task, stream, priority, cancellable))
+
+    def do_write_mime_type_finish(self, result):
+        return result.propagate_boolean()
+
 CSS = '''
 .unity-content { padding: 24px; }
 .unity-card { background: @card_bg_color; border: 1px solid alpha(@window_fg_color, 0.12); border-radius: 16px; }
 .notification-card { padding: 18px; }
-.metric-card { padding: 20px; }
+.metric-card { padding: 16px; }
 .media-card { padding: 24px; }
 .artwork { border-radius: 12px; background: alpha(@window_fg_color, 0.06); }
 .photo-tile { padding: 0; border-radius: 12px; border: 1px solid alpha(@window_fg_color, 0.12); background: @card_bg_color; }
@@ -85,31 +167,18 @@ def size_text(value):
         value /= 1024
 
 
-def battery_time_text(seconds):
-    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or not math.isfinite(seconds) or seconds < 0:
-        return None
-    if seconds < 60:
-        return 'Less than a minute'
-    minutes = int(seconds / 60)
-    days, hours = divmod(minutes // 60, 24)
-    if days:
-        return f'{days} d {hours} h'
-    hours, minutes = divmod(minutes, 60)
-    return f'{hours} h {minutes} min' if hours else f'{minutes} min'
-
-
-def image_texture(image):
+def image_texture(image, media=False):
     """Decode only bounded, daemon-validated JPEG data; never fetch remote URLs."""
     if not image or image.get('mime') != 'image/jpeg':
         return None
-    if not all(isinstance(image.get(k), int) and 1 <= image[k] <= 320 for k in ('width', 'height')):
+    if not all(isinstance(image.get(k), int) and 1 <= image[k] <= (1024 if media else 320) for k in ('width', 'height')):
         return None
     try:
         encoded = image['data']
-        if len(encoded) > 43692:
+        if len(encoded) > (262144 if media else 43692):
             return None
         raw = base64.b64decode(encoded, validate=True)
-        if len(raw) > 32768:
+        if len(raw) > (196608 if media else 32768):
             return None
         texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(raw))
         if (texture.get_width(), texture.get_height()) != (image['width'], image['height']):
@@ -293,6 +362,9 @@ class Window(Adw.ApplicationWindow):
         provider.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(self.get_display(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.devices, self.path, self.capabilities = {}, None, {}
+        self.firefox_updating = False
+        self.firefox_signature = None
+        self.firefox_status = {}
         self.pending_refresh = self.authorized = self.requested_access = False
         self.access_check_pending = False
         self.bus_name = None
@@ -317,6 +389,7 @@ class Window(Adw.ApplicationWindow):
         self.call_audio_catalog = {}
         self.call_audio_options = {'output': [''], 'microphone': ['']}
         self.call_audio_updating = self.call_audio_devices_pending = self.call_audio_selection_pending = False
+        self.call_audio_devices_refresh = None
         self.call_audio_muted = False
         self.call_phone_address = None
         self.call_uses_hfp = False
@@ -342,14 +415,29 @@ class Window(Adw.ApplicationWindow):
         self.selected_address = None
         self.photo_items, self.photo_widgets, self.preview_queue = {}, {}, []
         self.preview_inflight = 0
+        self.gallery_copy_supported = False
         self.cap_signature = None
+        self.phone_connectivity_state = {}
+        self.connectivity_updating = False
+        self.hotspot_command_pending = False
+        self.bluetooth_commands_pending = set()
+        self.phone_device_rows = {}
+        self.connectivity_notice = ''
+        self.desktop_preferences_updating = False
+        self.ringer_state = {}
         self.toasts = Adw.ToastOverlay()
         self.set_content(self.toasts)
         self.split = Adw.NavigationSplitView(min_sidebar_width=220, max_sidebar_width=260,
                                              sidebar_width_unit=Adw.LengthUnit.SP)
         self.toasts.set_child(self.split)
         sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        sidebar.append(Adw.HeaderBar(title_widget=Adw.WindowTitle(title='Unity')))
+        self.sidebar_toolbar = Adw.ToolbarView(top_bar_style=Adw.ToolbarStyle.FLAT)
+        self.sidebar_header = Adw.HeaderBar(title_widget=Adw.WindowTitle(title='Unity'))
+        self.app_menu = Gtk.MenuButton(icon_name='open-menu-symbolic', tooltip_text='Unity menu')
+        self.app_menu.set_popover(Gtk.PopoverMenu.new_from_model_full(app.get_menubar(), Gtk.PopoverMenuFlags.NESTED))
+        self.sidebar_header.pack_end(self.app_menu)
+        self.sidebar_toolbar.add_top_bar(self.sidebar_header)
+        self.sidebar_toolbar.set_content(sidebar)
         self.device_dropdown = Gtk.DropDown(model=Gtk.StringList.new(['No paired devices']))
         inset(self.device_dropdown, 12)
         self.device_dropdown.connect('notify::selected', self.device_selected)
@@ -364,17 +452,20 @@ class Window(Adw.ApplicationWindow):
         footer = inset(label('Local. Private. Connected.', 'dim-label'), 18)
         footer.add_css_class('caption')
         sidebar.append(footer)
-        self.split.set_sidebar(Adw.NavigationPage.new(sidebar, 'Unity'))
+        self.split.set_sidebar(Adw.NavigationPage.new(self.sidebar_toolbar, 'Unity'))
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.title = Adw.WindowTitle(title='Overview', subtitle='')
-        content.append(Adw.HeaderBar(title_widget=self.title))
+        self.content_toolbar = Adw.ToolbarView(top_bar_style=Adw.ToolbarStyle.FLAT)
+        self.content_header = Adw.HeaderBar(title_widget=self.title)
+        self.content_toolbar.add_top_bar(self.content_header)
+        self.content_toolbar.set_content(content)
         self.banner = Adw.Banner(title='Connecting to Unity…', revealed=True)
         self.banner.set_button_label('Retry')
         self.banner.connect('button-clicked', self.banner_action)
         content.append(self.banner)
         self.stack = Gtk.Stack(vexpand=True)
         content.append(self.stack)
-        self.split.set_content(Adw.NavigationPage.new(content, 'Overview'))
+        self.split.set_content(Adw.NavigationPage.new(self.content_toolbar, 'Overview'))
         self.pages = {}
         self.build_pages()
         # Libadwaita activates one matching breakpoint. The narrower condition
@@ -390,6 +481,7 @@ class Window(Adw.ApplicationWindow):
         self.render({})
         self.client = client_factory(self.changed, self.error)
         self.connect('close-request', self.close_main_call_window)
+        app.update_desktop()
 
     def register_page(self, name, title, icon, widget):
         self.stack.add_named(widget, name)
@@ -455,8 +547,8 @@ class Window(Adw.ApplicationWindow):
         entry.add_suffix(button)
         return entry, button
 
-    def metric(self, flow, icon, title):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, width_request=180)
+    def metric(self, row, icon, title):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.add_css_class('unity-card')
         box.add_css_class('metric-card')
         header = Gtk.Box(spacing=8)
@@ -464,40 +556,37 @@ class Window(Adw.ApplicationWindow):
         header.append(label(title, 'dim-label'))
         box.append(header)
         value = label('Unavailable', 'title-2', wrap=True)
-        detail = label('', 'dim-label', wrap=True)
-        detail.add_css_class('caption')
-        box.append(value)
-        box.append(detail)
-        flow.insert(box, -1)
-        return value, detail, box
+        readings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        readings.append(value)
+        box.append(readings)
+        row.append(box)
+        return value, readings
 
     def empty(self, title, description, icon):
         return Adw.StatusPage(title=title, description=description, icon_name=icon)
 
     def build_pages(self):
+        app = self.get_application()
         overview = self.page('overview', 'Overview', 'view-grid-symbolic')
         self.device_heading = label('Your phone, at a glance', 'title-1', wrap=True)
         overview.append(self.device_heading)
-        metrics = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
-                              min_children_per_line=1, max_children_per_line=3, column_spacing=12, row_spacing=12)
-        self.connection_value, self.connection_detail, _ = self.metric(metrics, 'network-wireless-symbolic', 'Connection')
-        self.battery_value, self.battery_detail, battery_card = self.metric(metrics, 'battery-symbolic', 'Battery')
-        self.battery_progress = Gtk.ProgressBar(show_text=False)
-        battery_card.append(self.battery_progress)
-        self.battery_power = label('', 'heading', wrap=True)
+        metrics = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
+                          halign=Gtk.Align.START)
+        self.connection_value, _ = self.metric(metrics, 'network-wireless-symbolic', 'Connection')
+        self.battery_value, battery_card = self.metric(metrics, 'battery-symbolic', 'Battery')
+        self.battery_power = label('', 'dim-label', wrap=True)
         self.battery_power.set_tooltip_text('Net power at the phone battery. Charging power excludes energy used directly by the phone.')
         battery_card.append(self.battery_power)
-        self.battery_time = label('', 'dim-label', wrap=True)
-        self.battery_time.add_css_class('caption')
-        battery_card.append(self.battery_time)
-        self.network_value, self.network_detail, _ = self.metric(metrics, 'network-cellular-symbolic', 'Network')
         overview.append(metrics)
         quick = self.group(overview, 'Quick actions')
-        self.find_button = self.button(quick, 'Find your phone', 'Ring', lambda *_: self.execute('find', 'ring'))
+        self.find_state = {}
+        self.find_button = self.button(quick, 'Find your phone', 'Ring', self.toggle_find_phone,
+            'Ring for 30 seconds. Alarm volume is restored after ringing stops.')
         self.url_entry, self.url_button = self.entry_action(quick, 'Share a web address', 'send-to-symbolic',
             lambda *_: self.execute('urls', 'open', {'url': self.url_entry.get_text()}))
-        self.clip_entry, self.clip_button = self.entry_action(quick, 'Send text to phone clipboard', 'edit-copy-symbolic',
-            lambda *_: self.execute('clipboard', 'set', {'text': self.clip_entry.get_text()}))
+        self.clip_status = Adw.ActionRow(title='Automatic clipboard sync')
+        self.clip_status.set_subtitle_lines(3)
+        quick.add(self.clip_status)
         self.url_receive = Adw.ActionRow(title='Received web page', subtitle='No shared URL')
         self.url_receive.set_subtitle_lines(2)
         self.url_open = icon_button('external-link-symbolic', 'Open received web page', self.open_received_url, 'flat')
@@ -551,7 +640,7 @@ class Window(Adw.ApplicationWindow):
 
         photos = self.page('photos', 'Photos', 'image-x-generic-symbolic')
         self.photos_button = icon_button('view-refresh-symbolic', 'Refresh photos', lambda *_: self.load_photos(True), 'flat')
-        self.heading(photos, 'Your recent photos', 'Small previews load first. Download an original when you need it.', self.photos_button)
+        self.heading(photos, 'Photos and videos', 'Thumbnails load first. Right-click an item to copy or download the original.', self.photos_button)
         self.photo_status = label('Open Photos to load your gallery.', 'dim-label', wrap=True)
         photos.append(self.photo_status)
         self.photos = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
@@ -561,8 +650,38 @@ class Window(Adw.ApplicationWindow):
         self.photos_empty = self.empty('Your gallery is waiting', 'Connect your phone and allow photo sharing.', 'image-x-generic-symbolic')
         photos.append(self.photos_empty)
 
+        connectivity = self.page('connectivity', 'Connectivity', 'network-wireless-symbolic')
+        self.heading(connectivity, 'Your phone connections',
+            'Mobile hotspot and Bluetooth devices are reported by your phone. Enable Phone connectivity and Nearby devices in Unity on Android.')
+        radio = self.group(connectivity, 'Phone Mobile Hotspot',
+            'Share your phone’s internet using your Samsung hotspot routines. The switch shows the state last reported by the phone.')
+        self.phone_hotspot = Adw.SwitchRow(title='Mobile Hotspot', subtitle='Connect and enable Phone connectivity on your phone.')
+        self.phone_hotspot.set_subtitle_lines(3)
+        self.phone_hotspot.connect('notify::active', self.toggle_phone_hotspot)
+        radio.add(self.phone_hotspot)
+        self.hotspot_choices = Adw.ActionRow(title='Set Mobile Hotspot',
+            subtitle='Hotspot state is unavailable. Send an explicit on or off request.')
+        self.hotspot_choices.set_subtitle_lines(3)
+        choices = Gtk.Box(spacing=8, valign=Gtk.Align.CENTER)
+        self.hotspot_on_button = Gtk.Button(label='On'); self.hotspot_off_button = Gtk.Button(label='Off')
+        self.hotspot_on_button.connect('clicked', lambda *_: self.request_phone_hotspot(True))
+        self.hotspot_off_button.connect('clicked', lambda *_: self.request_phone_hotspot(False))
+        choices.append(self.hotspot_on_button); choices.append(self.hotspot_off_button)
+        self.hotspot_choices.add_suffix(choices); radio.add(self.hotspot_choices)
+        self.connectivity_refresh = self.button(radio, 'Update phone connections', 'Refresh',
+            lambda *_: self.execute('phone_connectivity', 'refresh'))
+        self.phone_bluetooth_group = self.group(connectivity, 'Bluetooth devices connected to your phone',
+            'Turn a connected device off below to request its disconnection. Create its device-specific routine on the phone first.')
+        self.phone_bluetooth_hint = Adw.ActionRow(title='No phone connection report',
+            subtitle='Connect and enable Phone connectivity in Unity on Android.')
+        self.phone_bluetooth_hint.set_subtitle_lines(3)
+        self.phone_bluetooth_group.add(self.phone_bluetooth_hint)
+        self.connectivity_status = label('', 'dim-label', wrap=True)
+        connectivity.append(self.connectivity_status)
+
         media = self.page('media', 'Media', 'multimedia-player-symbolic')
-        audio_group = Adw.PreferencesGroup(title='Audio routing')
+        audio_group = Adw.PreferencesGroup(title='Audio routing',
+            description='Wi-Fi sends stereo; Bluetooth sends mono. Both links stay connected.')
         self.audio_route = Adw.SwitchRow(title='Play laptop audio on this phone',
             subtitle='Enable Laptop audio on phone in the Android Features page, then connect.')
         self.audio_route.set_subtitle_lines(3)
@@ -571,10 +690,53 @@ class Window(Adw.ApplicationWindow):
         self.audio_route.connect('notify::active', self.toggle_audio_route)
         self.audio_updating = False
         self.audio_pending = False
+        self.audio_pending_operation = None
         self.audio_state = {}
+        self.audio_transport = Adw.ComboRow(title='Audio connection', use_subtitle=True,
+            model=Gtk.StringList.new(['Automatic', 'Wi-Fi / LAN', 'Bluetooth']))
+        self.audio_transport.set_tooltip_text('Automatic prefers Wi-Fi and uses Bluetooth when Wi-Fi is disconnected.')
+        self.audio_transport.set_selected(['auto', 'lan', 'bluetooth'].index(app.preferences['audio_transport']))
+        self.audio_transport.connect('notify::selected', lambda row, _: app.set_preference('audio_transport',
+            ['auto', 'lan', 'bluetooth'][row.get_selected()]) if not self.desktop_preferences_updating else None)
+        audio_group.add(self.audio_transport)
         audio_group.add(self.audio_route)
+        self.phone_audio_route = Adw.SwitchRow(title='Play phone audio on this laptop',
+            subtitle='Approve media audio capture on the phone each time. Some apps block capture.')
+        self.phone_audio_route.set_subtitle_lines(3)
+        self.phone_audio_route.set_title_lines(2)
+        self.phone_audio_route.set_sensitive(False)
+        self.phone_audio_route.connect('notify::active', self.toggle_audio_route)
+        audio_group.add(self.phone_audio_route)
         media.append(audio_group)
-        self.media_heading = self.heading(media, 'Now playing', 'Control the active media session on your phone.')
+        sound_group = self.group(media, 'Device volume')
+        self.sound_widgets = {}
+        self.sound_pending = {}
+        self.sound_state = {}
+        for source, title in [('desktop', 'Laptop output volume'), ('phone', 'Phone media volume')]:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_start=14, margin_end=14, margin_top=12, margin_bottom=12)
+            row = Gtk.Box(spacing=12)
+            heading = label(title, 'heading', hexpand=True, wrap=True)
+            level = label('Unavailable', 'dim-label')
+            mute = icon_button('audio-volume-high-symbolic', 'Mute ' + ('laptop' if source == 'desktop' else 'phone'), lambda _, s=source: self.mute_sound(s), 'flat')
+            row.append(heading); row.append(level); row.append(mute); box.append(row)
+            scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+            scale.set_draw_value(False)
+            scale.set_tooltip_text(title)
+            scale.connect('change-value', self.change_sound, source)
+            box.append(scale)
+            hint = label('', 'caption', wrap=True)
+            box.append(hint)
+            sound_group.add(box)
+            self.sound_widgets[source] = {'scale': scale, 'mute': mute, 'level': level, 'hint': hint}
+        self.media_heading = self.heading(media, 'Now playing', 'Choose a player on your laptop or phone.')
+        players_group = self.group(media, 'Players')
+        self.media_picker = Adw.ComboRow(title='Player', model=Gtk.StringList.new(['No active players']))
+        players_group.add(self.media_picker)
+        self.media_players = []
+        self.media_selection = None
+        self.media_model_signature = None
+        self.media_picker_updating = False
+        self.media_picker.connect('notify::selected', self.select_media_player)
         self.media_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         self.media_card.add_css_class('unity-card')
         self.media_card.add_css_class('media-card')
@@ -592,7 +754,7 @@ class Window(Adw.ApplicationWindow):
         self.art_stack.add_named(Gtk.Image(icon_name='audio-x-generic-symbolic', pixel_size=72), 'empty')
         self.media_card.append(self.art_stack)
         self.media_title = label('Nothing playing', 'title-1', wrap=True, justify=Gtk.Justification.CENTER, halign=Gtk.Align.CENTER)
-        self.media_artist = label('Start playback on your phone.', 'dim-label', wrap=True, halign=Gtk.Align.CENTER)
+        self.media_artist = label('Start playback on your laptop or phone.', 'dim-label', wrap=True, halign=Gtk.Align.CENTER)
         self.media_album = label('', 'dim-label', wrap=True, halign=Gtk.Align.CENTER)
         self.media_album.add_css_class('caption')
         for widget in (self.media_title, self.media_artist, self.media_album):
@@ -602,6 +764,9 @@ class Window(Adw.ApplicationWindow):
         self.media_seek.set_draw_value(False)
         self.media_seek.connect('change-value', self.seek_media)
         progress.append(self.media_seek)
+        self.media_waiting = Gtk.ProgressBar(visible=False)
+        self.media_waiting.set_tooltip_text('Waiting for the player to publish the track duration')
+        progress.append(self.media_waiting)
         timebox = Gtk.Box()
         self.media_elapsed = label('0:00', 'dim-label', hexpand=True)
         self.media_duration = label('0:00', 'dim-label')
@@ -612,10 +777,10 @@ class Window(Adw.ApplicationWindow):
         progress.append(timebox)
         self.media_card.append(progress)
         controls = Gtk.Box(spacing=20, halign=Gtk.Align.CENTER)
-        self.media_previous = icon_button('media-skip-backward-symbolic', 'Previous track', lambda *_: self.execute('media', 'previous'), 'circular')
+        self.media_previous = icon_button('media-skip-backward-symbolic', 'Previous track', lambda *_: self.media_action('previous'), 'circular')
         self.media_toggle = icon_button('media-playback-start-symbolic', 'Play', self.toggle_media, 'suggested-action')
         self.media_toggle.add_css_class('player-primary')
-        self.media_next = icon_button('media-skip-forward-symbolic', 'Next track', lambda *_: self.execute('media', 'next'), 'circular')
+        self.media_next = icon_button('media-skip-forward-symbolic', 'Next track', lambda *_: self.media_action('next'), 'circular')
         for button in (self.media_previous, self.media_toggle, self.media_next):
             button.add_css_class('player-control')
             controls.append(button)
@@ -624,6 +789,10 @@ class Window(Adw.ApplicationWindow):
         self.media_info.add_css_class('caption')
         self.media_card.append(self.media_info)
         self.media_state = {}
+        self.media_sample_at = time.monotonic()
+        self.media_tick_source = None
+        self.connect('realize', lambda *_: self.start_media_clock())
+        self.connect('unrealize', lambda *_: self.stop_media_clock())
         self.art_key = None
 
         ring = self.group(media, 'Phone sound')
@@ -631,7 +800,18 @@ class Window(Adw.ApplicationWindow):
         ring.add(self.ringer_combo)
         self.ringer_button = self.button(ring, 'Apply mode', 'Apply', lambda *_: self.execute('ringer', 'set',
             {'mode': ['normal', 'vibrate', 'silent', 'dnd', 'off'][self.ringer_combo.get_selected()]}))
-        self.hotspot_button = self.button(ring, 'Phone internet sharing', 'Request', lambda *_: self.execute('hotspot', 'request_settings'), 'Review internet sharing settings on your phone.')
+        internet = self.group(connectivity, 'Phone internet sharing')
+        self.hotspot_button = self.button(internet, 'Phone internet sharing', 'Request', lambda *_: self.execute('hotspot', 'request_settings'), 'Review internet sharing settings on your phone.')
+        self.routines_group = self.group(connectivity, 'Samsung Routines',
+            'Set up keyword routines in Unity on your phone. Samsung runs the actions; Unity confirms only that the trigger was sent.')
+        self.routine_buttons = []
+        for title, action, subtitle in [
+                ('Mobile hotspot on', 'hotspot_on', 'UNITY_HOTSPOT_ON'),
+                ('Mobile hotspot off', 'hotspot_off', 'UNITY_HOTSPOT_OFF'),
+                ('Disconnect Bluetooth device', 'disconnect_bluetooth', 'The specific device is selected in your Samsung routine.')]:
+            self.routine_buttons.append(self.button(self.routines_group, title, 'Send trigger',
+                lambda *_, action=action: self.execute('samsung_routines', action), subtitle))
+        self.routines_group.set_visible(False)
 
         remote = self.page('remote', 'Remote Control', 'input-keyboard-symbolic')
         self.heading(remote, 'A little closer to your phone', 'Lock devices, share screens, and type on your phone.')
@@ -643,9 +823,15 @@ class Window(Adw.ApplicationWindow):
         self.screen_control_switch = Adw.SwitchRow(title='Control computer from phone', subtitle='Allow keyboard and mouse access in the desktop sharing chooser.')
         self.screen_control_switch.set_active(True)
         screens.add(self.screen_control_switch)
-        self.screen_blank_switch = Adw.SwitchRow(title='Turn off laptop display while sharing', subtitle='The panel turns off after the phone viewer opens. It restores when sharing stops or the connection is lost.')
+        self.screen_blank_switch = Adw.SwitchRow(title='Use phone as main display', subtitle='Make the phone the primary monitor and disable the laptop panel after the viewer opens. Restore the previous display layout when sharing stops.')
         self.screen_blank_switch.set_subtitle_lines(3)
         screens.add(self.screen_blank_switch)
+        self.screen_extend_switch = Adw.SwitchRow(title='Use phone as extended display',
+            subtitle='Add a separate desktop beside the laptop display. Both screens stay on.')
+        self.screen_extend_switch.set_subtitle_lines(3)
+        screens.add(self.screen_extend_switch)
+        self.screen_extend_switch.connect('notify::active', lambda row, _: self.screen_blank_switch.set_active(False) if row.get_active() else None)
+        self.screen_blank_switch.connect('notify::active', lambda row, _: self.screen_extend_switch.set_active(False) if row.get_active() else None)
         def control_changed(row, _):
             self.screen_blank_switch.set_sensitive(row.get_active())
             if not row.get_active(): self.screen_blank_switch.set_active(False)
@@ -675,21 +861,54 @@ class Window(Adw.ApplicationWindow):
         drag.connect('drag-begin', self.drag_begin)
         drag.connect('drag-end', self.drag_end)
         self.pad.add_controller(drag)
+        firefox = self.page('firefox', 'Firefox', 'web-browser-symbolic')
+        self.heading(firefox, 'Continue in Firefox', 'See saved pages and restore your place in Firefox on this computer.')
+        connection = self.group(firefox, 'Connection')
+        self.firefox_connection = Adw.ActionRow()
+        self.firefox_connection.set_use_markup(False)
+        self.firefox_connection.set_title('Firefox extension')
+        self.firefox_connection.set_subtitle('Enable the Firefox extension in Settings, then connect from its Settings & privacy page.')
+        self.firefox_connection.set_subtitle_lines(3)
+        connection.add(self.firefox_connection)
+        saved = self.group(firefox, 'Saved pages', 'Full checkpoints and approved form values stay in Firefox. Summaries are removed when the browser disconnects.')
+        self.firefox_contexts = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.firefox_contexts.add_css_class('boxed-list')
+        saved.add(self.firefox_contexts)
         settings = self.page('settings', 'Settings', 'preferences-system-symbolic', preferences=True)
+        desktop = self.group(settings, 'Desktop and menus')
+        self.background_switch = Adw.SwitchRow(title='Keep Unity in the top bar',
+            subtitle='Keep the indicator and quick actions available after closing the window.')
+        self.background_switch.set_active(app.preferences['keep_running'])
+        self.background_switch.connect('notify::active', lambda row, _: app.set_preference('keep_running', row.get_active())
+            if not self.desktop_preferences_updating else None)
+        desktop.add(self.background_switch)
+        self.indicator_status_switch = Adw.SwitchRow(title='Show phone status in the indicator',
+            subtitle='Show the selected phone, connection and battery above the quick actions.')
+        self.indicator_status_switch.set_active(app.preferences['show_status'])
+        self.indicator_status_switch.connect('notify::active', lambda row, _: app.set_preference('show_status', row.get_active())
+            if not self.desktop_preferences_updating else None)
+        desktop.add(self.indicator_status_switch)
+        self.appearance_combo = Adw.ComboRow(title='Appearance', model=Gtk.StringList.new(['System', 'Light', 'Dark']))
+        self.appearance_combo.set_selected(['system', 'light', 'dark'].index(app.preferences['appearance']))
+        self.appearance_combo.connect('notify::selected', lambda row, _: app.set_preference('appearance',
+            ['system', 'light', 'dark'][row.get_selected()]) if not self.desktop_preferences_updating else None)
+        desktop.add(self.appearance_combo)
+        browser = self.group(settings, 'Firefox companion')
+        self.firefox_switch = Adw.SwitchRow(title='Enable Firefox extension', subtitle='Allow the Session Continuity extension to share saved-page summaries and receive restore requests on this computer.')
+        self.firefox_switch.set_subtitle_lines(3)
+        self.firefox_switch.set_sensitive(False)
+        self.firefox_switch.connect('notify::active', self.toggle_firefox)
+        browser.add(self.firefox_switch)
         security = self.group(settings, 'Privacy and access')
-        self.access_row = Adw.ActionRow(title='Access to your phone', subtitle='Checking access…')
+        self.access_row = Adw.ActionRow(title='App access', subtitle='Checking access…')
         self.access_row.set_subtitle_lines(3)
         self.access_button = Gtk.Button(label='Allow access', valign=Gtk.Align.CENTER)
         self.access_button.connect('clicked', self.authorize_this_app)
         self.access_button.set_sensitive(False)
         self.access_row.add_suffix(self.access_button)
         security.add(self.access_row)
-        appearance = Adw.ComboRow(title='Appearance', model=Gtk.StringList.new(['System', 'Light', 'Dark']))
-        appearance.connect('notify::selected', lambda row, _: Adw.StyleManager.get_default().set_color_scheme(
-            [Adw.ColorScheme.DEFAULT, Adw.ColorScheme.FORCE_LIGHT, Adw.ColorScheme.FORCE_DARK][row.get_selected()]))
-        security.add(appearance)
         pairing = self.group(settings, 'Pair devices')
-        self.discovery_button = self.button(pairing, 'Open pairing for Wi-Fi or Bluetooth', 'Discover', self.discover)
+        self.discovery_button = self.button(pairing, 'Open pairing for Wi-Fi or Bluetooth', 'Pair', self.discover)
         self.pair_info = label('Pairing is closed', 'dim-label', wrap=True, selectable=True)
         pairing.add(self.pair_info)
         self.pair_requests = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
@@ -698,6 +917,89 @@ class Window(Adw.ApplicationWindow):
         self.cap_group = self.group(settings, 'Permissions and capabilities', 'Features depend on the permissions and support available on your phone.')
         self.cap_rows = []
         self.nav.select_row(self.pages['overview'])
+
+    def toggle_firefox(self, row, _):
+        if self.firefox_updating or not self.authorized:
+            return
+        row.set_sensitive(False)
+        def failed(message):
+            self.render_firefox(json.dumps(self.firefox_status))
+            self.error(message)
+        self.client.call(ROOT, 'org.unityconnect.Manager1', 'SetFirefoxEnabled', '(b)', (row.get_active(),),
+                         lambda _: self.fetch_firefox(), failed=failed)
+
+    def fetch_firefox(self):
+        if self.authorized:
+            self.client.manager('FirefoxStatus', done=self.render_firefox)
+
+    def restore_firefox(self, profile_id, context_id=''):
+        if not self.authorized:
+            return
+        self.client.manager('RestoreFirefoxContext', '(ss)', (profile_id, context_id),
+                            lambda _: self.fetch_firefox())
+
+    def render_firefox(self, payload):
+        status = json.loads(payload) if self.authorized else {}
+        self.firefox_status = status
+        self.firefox_updating = True
+        self.firefox_switch.set_active(bool(status.get('enabled')))
+        self.firefox_switch.set_sensitive(self.authorized)
+        self.firefox_updating = False
+        profiles = status.get('profiles', []) if status.get('enabled') else []
+        count = len(profiles)
+        subtitle = status.get('error') or ('Connected to Firefox' if count else
+            'In the extension, open Settings & privacy and turn on Connect to Unity Linux.' if status.get('enabled') else
+            'Enable Firefox extension in Unity Settings to connect.')
+        if not self.authorized:
+            subtitle = 'Allow this app access to see Firefox summaries and use restore controls.'
+        self.firefox_connection.set_subtitle(subtitle)
+        self.get_application().update_desktop()
+        signature = json.dumps([self.authorized, status], sort_keys=True)
+        if signature == self.firefox_signature:
+            return
+        self.firefox_signature = signature
+        self.clear(self.firefox_contexts)
+        for index, profile in enumerate(profiles, 1):
+            summary = profile.get('summary', {})
+            active_id = summary.get('activeId')
+            header = Adw.ActionRow(title=f'Firefox profile {index}', subtitle='Tracking' if summary.get('tracking') else 'Tracking paused')
+            header.set_use_markup(False)
+            last = profile.get('last_result') or {}
+            if last.get('note'):
+                header.set_subtitle(last['note'] + ' · ' + summary.get('restoreState', 'idle'))
+            restore = Gtk.Button(label='Restore last active', valign=Gtk.Align.CENTER)
+            restore.set_sensitive(bool(active_id))
+            restore.connect('clicked', lambda _, p=profile['id']: self.restore_firefox(p))
+            header.add_suffix(restore)
+            self.firefox_contexts.append(header)
+            for context in summary.get('contexts', []):
+                details = []
+                if context['id'] == active_id:
+                    details.append('Last active')
+                for media in context.get('media', []):
+                    details.append(f"{media['kind'].title()} at {call_duration(media['time'])}")
+                if context.get('scrollProgress') is not None:
+                    details.append(f"Read {round(context['scrollProgress'] * 100)}%")
+                if context.get('closed'):
+                    details.append('Closed')
+                row = Adw.ActionRow()
+                row.set_use_markup(False)
+                row.set_title(context['url'])
+                row.set_subtitle(' · '.join(details) or 'Saved page')
+                row.set_title_lines(2)
+                row.set_subtitle_lines(2)
+                button = Gtk.Button(label='Restore', valign=Gtk.Align.CENTER)
+                button.set_sensitive(not context.get('closed'))
+                button.connect('clicked', lambda _, p=profile['id'], c=context['id']: self.restore_firefox(p, c))
+                row.add_suffix(button)
+                self.firefox_contexts.append(row)
+        if not profiles:
+            empty = Adw.ActionRow()
+            empty.set_use_markup(False)
+            empty.set_title('No Firefox pages connected')
+            empty.set_subtitle(subtitle)
+            empty.set_subtitle_lines(3)
+            self.firefox_contexts.append(empty)
 
     def build_messages(self):
         self.message_split = Adw.NavigationSplitView(min_sidebar_width=220, max_sidebar_width=280, sidebar_width_unit=Adw.LengthUnit.SP)
@@ -1037,7 +1339,8 @@ class Window(Adw.ApplicationWindow):
         self.call_popup = self.call_popup_panel = self.call_popup_toasts = self.call_popup_status = None
         if self.popup_has_calls and (self.popup_only or not self.get_visible()):
             def close_if_finished():
-                if self.call_popup is None and (not self.call_control_state.get('calls') or not self.enabled('call_control')):
+                if (self.call_popup is None and (not self.call_control_state.get('calls') or not self.enabled('call_control'))
+                        and not self.get_application().keep_in_background(self)):
                     self.destroy()
                 return False
             GLib.idle_add(close_if_finished)
@@ -1079,10 +1382,14 @@ class Window(Adw.ApplicationWindow):
                 GLib.source_remove(self.call_popup_empty_source); self.call_popup_empty_source = None
             if self.call_timer_source is not None:
                 GLib.source_remove(self.call_timer_source); self.call_timer_source = None
-            self.destroy()
+            if not self.get_application().keep_in_background(self):
+                self.destroy()
         return False
 
     def close_main_call_window(self, *_):
+        if self.get_application().keep_in_background(self):
+            self.set_visible(False)
+            return True
         if self.call_popup and self.call_popup.get_visible():
             self.set_visible(False)
             return True
@@ -1156,8 +1463,16 @@ class Window(Adw.ApplicationWindow):
         finally:
             self.call_audio_updating = False
 
-    def refresh_call_audio_devices(self, *_):
+    def refresh_call_audio_devices(self, *_, automatic=False):
         if not self.enabled('call_control') or self.call_audio_devices_pending: return
+        target = (self.path, self.generation)
+        now = time.monotonic()
+        previous = self.call_audio_devices_refresh
+        # Rendering an operation's own completion also reloads the visible page.
+        # Avoid turning that refresh into an endless chain of audio_devices calls.
+        if automatic and previous and previous[:2] == target and now - previous[2] < 15:
+            return
+        self.call_audio_devices_refresh = (*target, now)
         self.call_audio_devices_pending = True
         self.call_audio_refresh.set_sensitive(False)
         def loaded(result):
@@ -1222,15 +1537,18 @@ class Window(Adw.ApplicationWindow):
             self.pump_previews()
         elif page == 'calls' and self.enabled('call_control'):
             if not self.history_loaded: self.load_call_history()
-            self.refresh_call_audio_devices()
+            self.refresh_call_audio_devices(automatic=True)
         elif page == 'messages' and self.enabled('sms'):
             self.load_messages()
 
     def error(self, message):
+        if self.get_application().keep_in_background(self) and not self.get_visible():
+            self.present()
         self.access_check_pending = False
         if 'NotAuthorized' in message:
             self.authorized = False
             self.render({})
+            self.render_firefox('{}')
             self.show_access_prompt()
             return
         if 'ServiceUnknown' in message or 'NameHasNoOwner' in message:
@@ -1238,6 +1556,7 @@ class Window(Adw.ApplicationWindow):
         if any(s in message for s in ('NotAuthorized', 'daemon stopped', 'daemon is stopped', 'Disconnected')):
             self.authorized = False
             self.render({})
+            self.render_firefox('{}')
         if self.call_popup_toasts and self.call_popup and self.call_popup.get_visible():
             self.call_popup_toasts.add_toast(Adw.Toast(title=message))
         self.banner.set_title(message)
@@ -1245,10 +1564,10 @@ class Window(Adw.ApplicationWindow):
         self.banner.set_revealed(True)
 
     def show_access_prompt(self):
-        self.access_row.set_subtitle('Allow Unity to show phone notifications, messages, and files, and control supported features.')
+        self.access_row.set_subtitle('Allow Unity to show phone data and Firefox page summaries, and control supported features.')
         self.access_button.set_visible(True)
         self.access_button.set_sensitive(bool(self.bus_name))
-        self.banner.set_title('Allow Unity to access your phone.')
+        self.banner.set_title('Allow Unity to access your devices and browser.')
         self.banner.set_button_label('Allow access')
         self.banner.set_revealed(True)
 
@@ -1261,8 +1580,8 @@ class Window(Adw.ApplicationWindow):
     def authorize_this_app(self, *_):
         if not self.bus_name or self.authorized:
             return
-        dialog = Adw.AlertDialog(heading='Allow access to your phone?',
-            body='Unity can display notifications, messages, and files, and use controls such as sending SMS and playing media. Access applies to this app session.')
+        dialog = Adw.AlertDialog(heading='Allow Unity access?',
+            body='Unity can display phone notifications, messages, files and Firefox page summaries, and use controls such as sending SMS, playing media and restoring Firefox pages. Access applies to this app session.')
         dialog.add_response('cancel', 'Cancel')
         dialog.add_response('allow', 'Allow access')
         dialog.set_response_appearance('allow', Adw.ResponseAppearance.SUGGESTED)
@@ -1305,6 +1624,7 @@ class Window(Adw.ApplicationWindow):
             self.bus_name = None
             self.operations.clear()
             self.render({})
+            self.render_firefox('{}')
             path = ROOT
         if path == ROOT and self.pairing_active and self.authorized:
             self.client.manager('PairingInfo', done=self.pairing)
@@ -1341,6 +1661,10 @@ class Window(Adw.ApplicationWindow):
             self.authorized = False
             self.render({})
         self.authorized = bool(approved)
+        if self.authorized:
+            self.fetch_firefox()
+        else:
+            self.render_firefox('{}')
         self.access_button.set_visible(not self.authorized)
         if self.authorized:
             self.access_row.set_subtitle('Unity has access for this app session.')
@@ -1435,7 +1759,7 @@ class Window(Adw.ApplicationWindow):
                 self.cap_group.remove(row)
             self.cap_rows.clear()
             for feature, cap in self.capabilities.items():
-                row = Adw.SwitchRow(title='Laptop audio on phone' if feature == 'audio' else feature.replace('_', ' ').title(), subtitle=cap['reason'] or cap['status'].replace('_', ' '))
+                row = Adw.SwitchRow(title='Phone and laptop audio' if feature == 'audio' else feature.replace('_', ' ').title(), subtitle=cap['reason'] or cap['status'].replace('_', ' '))
                 row.set_subtitle_lines(3)
                 row.set_active(cap['status'] != 'disabled')
                 row.set_sensitive(self.authorized and cap['status'] in ('available', 'disabled', 'user_action_required'))
@@ -1443,17 +1767,22 @@ class Window(Adw.ApplicationWindow):
                     'org.unityconnect.Device1', 'SetFeatureEnabled', '(sb)', (f, row.get_active())))
                 self.cap_group.add(row)
                 self.cap_rows.append(row)
-        controls = [(self.find_button, 'find'), (self.url_button, 'urls'), (self.clip_button, 'clipboard'),
+        controls = [(self.find_button, 'find'), (self.url_button, 'urls'),
                     (self.sms_button, 'sms'), (self.new_message, 'sms'), (self.message_refresh, 'sms'),
                     (self.photos_button, 'photos'), (self.browse_button, 'browsing'), (self.remote_button, 'remote_input'),
                     (self.lock_phone_button, 'lock'), (self.share_desktop_button, 'screen'), (self.view_phone_button, 'screen'),
                     (self.pad, 'remote_input'), (self.ringer_button, 'ringer'), (self.hotspot_button, 'hotspot')]
         for widget, feature in controls:
             widget.set_sensitive(self.enabled(feature))
+        self.routines_group.set_visible(self.capabilities.get('samsung_routines', {}).get('status') in
+                                        ('available', 'disabled', 'permission_required', 'user_action_required'))
+        for button in self.routine_buttons:
+            button.set_sensitive(self.enabled('samsung_routines'))
+        self.render_phone_connectivity(self.phone_connectivity_state)
         self.discovery_button.set_sensitive(self.authorized)
         self.unpair_button.set_sensitive(bool(self.authorized and self.path))
         groups = {'notifications': ['notifications'], 'messages': ['sms'], 'calls': ['call_notifications', 'call_control'],
-                  'files': ['files', 'browsing'], 'photos': ['photos'], 'media': ['media', 'audio', 'ringer', 'hotspot'],
+                  'files': ['files', 'browsing'], 'photos': ['photos'], 'media': ['media', 'desktop_media', 'sound', 'audio', 'ringer'],
                   'remote': ['remote_input', 'find', 'lock', 'screen']}
         for page, features in groups.items():
             visible = any(self.capabilities.get(f, {}).get('status') in ('available', 'user_action_required') for f in features)
@@ -1465,9 +1794,11 @@ class Window(Adw.ApplicationWindow):
             if not visible and self.stack.get_visible_child_name() == page:
                 self.nav.select_row(self.pages['overview'])
         self.update_media_controls()
+        self.render_sound(self.sound_state)
         self.render_audio_route(self.audio_state)
         self.render_screen(self.screen_state)
         self.render_file_selection()
+        self.get_application().update_desktop()
 
     @staticmethod
     def clear(box):
@@ -1478,22 +1809,19 @@ class Window(Adw.ApplicationWindow):
         state = device.get('state', {})
         connected = device.get('connected', False)
         self.device_heading.set_label(device.get('name') or 'Your phone, at a glance')
-        self.connection_value.set_label('Connected' if connected else 'Disconnected')
         transport = state.get('transport', {})
-        detail = {'both': 'Bluetooth + Wi-Fi / LAN · Encrypted', 'bluetooth': 'Bluetooth · Encrypted', 'lan': 'Wi-Fi / LAN · Encrypted'}.get(transport.get('kind'), 'Encrypted connection')
-        if transport.get('kind') == 'both':
-            detail += '\nControls over Bluetooth · Files and streams over Wi-Fi / LAN'
-        self.connection_detail.set_label(detail if connected else 'Live information is unavailable')
+        self.connection_value.set_label({'both': 'LAN + Bluetooth connected', 'bluetooth': 'Bluetooth connected',
+            'lan': 'LAN connected'}.get(transport.get('kind'), 'Connected') if connected else 'Disconnected')
         self.render_battery(state.get('battery', {}) if connected else {})
-        network = state.get('network', {})
-        self.network_value.set_label({'wifi': 'Wi-Fi', 'cellular': 'Mobile data', 'ethernet': 'Ethernet', 'none': 'Offline'}.get(network.get('kind'), 'Unavailable'))
-        signal = network.get('signal')
-        self.network_detail.set_label(' · '.join(filter(None, [network.get('operator'), f'Signal {signal}/4' if signal is not None else ''])))
+        self.render_find_phone(state.get('find', {}) if connected else {})
         self.render_calls(state if connected and self.authorized else {}, connected)
         reports = state.get('sms', {}).get('reports', {})
         if self.last_sms_id in reports:
             self.send_hint.set_label({'submitted_to_modem':'Waiting for carrier reports.', 'sent':'Sent. Delivery report pending.', 'delivered':'Delivered.', 'failed':'Message failed to send.', 'delivery_failed':'Carrier reported delivery failure.'}.get(reports[self.last_sms_id].get('state'), 'Status unavailable.'))
-        self.render_media(state.get('media', {}))
+        self.render_media_sources(state if connected else {})
+        self.render_sound(state if connected else {})
+        self.ringer_state = state.get('ringer', {}) if connected and self.authorized else {}
+        self.render_phone_connectivity(state.get('phone_connectivity', {}) if connected and self.authorized else {})
         if not connected:
             self.audio_pending = False
         self.render_audio_route(state.get('audio', {}))
@@ -1538,6 +1866,7 @@ class Window(Adw.ApplicationWindow):
             self.chat_title.set_title('Choose a conversation')
             self.message_hint.set_label('Messages are cleared while disconnected.')
             self.photo_items, self.photo_widgets, self.preview_queue = {}, {}, []
+            self.gallery_copy_supported = False
             self.preview_inflight = 0
             self.clear(self.photos)
             self.photos_empty.set_visible(True)
@@ -1550,47 +1879,108 @@ class Window(Adw.ApplicationWindow):
             self.banner.set_revealed(False)
             self.access_row.set_subtitle('Unity has access for this app session.')
         self.render_capabilities()
+        self.clip_status.set_subtitle('Text syncs automatically in both directions. For Android background sending, allow Shizuku access in Unity on your phone; keep your current keyboard.'
+            if connected and self.enabled('clipboard') else 'Connect and enable Clipboard to sync text automatically.')
         if connected and hasattr(self, 'client'):
             self.load_visible()
 
+    def render_phone_connectivity(self, state):
+        reporting = self.enabled('phone_connectivity')
+        if state != self.phone_connectivity_state:
+            self.connectivity_notice = ''
+        self.phone_connectivity_state = state if reporting else {}
+        state = self.phone_connectivity_state
+        if not reporting or not state:
+            self.hotspot_command_pending = False
+            self.bluetooth_commands_pending.clear()
+            self.connectivity_notice = ''
+        self.connectivity_updating = True
+        hotspot = state.get('hotspot_enabled')
+        self.phone_hotspot.set_active(hotspot is True)
+        self.phone_hotspot.set_sensitive(reporting and self.enabled('samsung_routines') and
+                                      isinstance(hotspot, bool) and not self.hotspot_command_pending)
+        self.phone_hotspot.set_subtitle(('On' if hotspot else 'Off') + ' · Reported by phone' if isinstance(hotspot, bool) else
+            'Hotspot state unavailable · use the On and Off buttons below')
+        self.hotspot_choices.set_visible(not isinstance(hotspot, bool))
+        for button in (self.hotspot_on_button, self.hotspot_off_button):
+            button.set_sensitive(self.enabled('samsung_routines') and not self.hotspot_command_pending)
+        self.connectivity_refresh.set_sensitive(reporting)
+        devices = {device['address']: device for device in state.get('devices', [])}
+        for address in list(self.phone_device_rows):
+            if address not in devices:
+                self.phone_bluetooth_group.remove(self.phone_device_rows.pop(address))
+                self.bluetooth_commands_pending.discard(address)
+        for address, device in devices.items():
+            row = self.phone_device_rows.get(address)
+            if row is None:
+                row = Adw.SwitchRow()
+                row.set_use_markup(False); row.set_subtitle_lines(3); row.set_title_lines(2)
+                row.connect('notify::active', lambda row, _, target=address: self.toggle_phone_bluetooth(row, target))
+                self.phone_device_rows[address] = row
+                self.phone_bluetooth_group.add(row)
+            row.set_title(device.get('name') or 'Bluetooth device')
+            row.set_subtitle(address + ' · ' + ', '.join(device.get('profiles', [])) +
+                             (' · Disconnect trigger pending' if address in self.bluetooth_commands_pending else ' · Connected'))
+            row.set_tooltip_text('Samsung routine keyword: UNITY_BLUETOOTH_DISCONNECT_' + address.replace(':', ''))
+            row.set_active(True)
+            row.set_sensitive(reporting and self.enabled('samsung_routines') and address not in self.bluetooth_commands_pending)
+        self.phone_bluetooth_hint.set_visible(not devices)
+        status = state.get('bluetooth_status')
+        self.phone_bluetooth_hint.set_title({'permission_required': 'Allow Nearby devices on your phone', 'off': 'Phone Bluetooth is off',
+            'unsupported': 'Phone Bluetooth is unavailable'}.get(status, 'No connected Bluetooth devices reported' if state else 'No phone connection report'))
+        self.phone_bluetooth_hint.set_subtitle(state.get('reason') or 'Enable Phone connectivity and allow Nearby devices in Unity on your phone.')
+        self.connectivity_status.set_label(self.connectivity_notice or state.get('reason', ''))
+        self.connectivity_updating = False
+        self.get_application().update_desktop()
+
+    def toggle_phone_hotspot(self, row, _):
+        if self.connectivity_updating:
+            return
+        desired = row.get_active()
+        if not isinstance(self.phone_connectivity_state.get('hotspot_enabled'), bool) or desired == self.phone_connectivity_state['hotspot_enabled']:
+            return
+        self.request_phone_hotspot(desired)
+
+    def request_phone_hotspot(self, desired):
+        if not self.enabled('samsung_routines'):
+            self.render_phone_connectivity(self.phone_connectivity_state)
+            return
+        self.hotspot_command_pending = True
+        self.connectivity_notice = 'Sending Mobile Hotspot trigger…'
+        self.render_phone_connectivity(self.phone_connectivity_state)
+        def finished(result):
+            self.hotspot_command_pending = False
+            self.connectivity_notice = result.get('reason', 'Hotspot trigger sent; waiting for the phone state.') if result else 'Hotspot trigger failed. Check phone permissions and routines.'
+            self.render_phone_connectivity(self.phone_connectivity_state)
+        self.execute('samsung_routines', 'hotspot_on' if desired else 'hotspot_off', done=finished)
+
+    def toggle_phone_bluetooth(self, row, address):
+        if self.connectivity_updating or row.get_active():
+            return
+        self.request_bluetooth_disconnect(address)
+
+    def request_bluetooth_disconnect(self, address):
+        if address not in self.phone_device_rows or not self.enabled('samsung_routines'):
+            self.render_phone_connectivity(self.phone_connectivity_state)
+            return
+        self.bluetooth_commands_pending.add(address)
+        self.connectivity_notice = 'Sending Bluetooth disconnect trigger…'
+        self.render_phone_connectivity(self.phone_connectivity_state)
+        def finished(result):
+            self.bluetooth_commands_pending.discard(address)
+            self.connectivity_notice = result.get('reason', 'Disconnect trigger sent; waiting for the phone state.') if result else 'Disconnect trigger failed. Check the device-specific phone routine.'
+            self.render_phone_connectivity(self.phone_connectivity_state)
+        self.execute('samsung_routines', 'disconnect_bluetooth_device', {'address': address}, done=finished)
+
     def render_battery(self, battery):
         self.battery_value.set_label(f"{battery['level']}%" if battery else 'Unavailable')
-        status = battery.get('status')
-        description = {'full': 'Fully charged', 'charging': 'Charging', 'discharging': 'On battery',
-                       'not_charging': 'Plugged in · Charging paused' if battery.get('plugged') else 'On battery',
-                       'unknown': 'Battery status unavailable'}.get(status)
-        self.battery_detail.set_label(description or (('Charging' if battery.get('charging') else 'On battery') if battery else 'Connect your phone'))
-        self.battery_progress.set_fraction(battery.get('level', 0) / 100)
         self.battery_power.set_visible(bool(battery))
-        self.battery_time.set_visible(bool(battery))
         if not battery:
             self.battery_power.set_label('')
-            self.battery_time.set_label('')
-            return
-        if 'power_w' not in battery:
-            self.battery_power.set_label('Power draw unavailable')
-            self.battery_time.set_label('Update the Android companion for power and time estimates.')
-            self.battery_time.set_tooltip_text(None)
             return
         watts = battery.get('power_w')
         valid_power = isinstance(watts, (int, float)) and not isinstance(watts, bool) and math.isfinite(watts)
-        self.battery_power.set_label(f'{"Charging" if watts < 0 else "Battery draw"} · {abs(watts):.2f} W' if valid_power else 'Power not reported by phone')
-        duration = battery_time_text(battery.get('remaining_seconds'))
-        if duration is not None and battery.get('estimate_state') == 'available':
-            if status == 'full':
-                text = 'Fully charged'
-            elif battery.get('estimate_kind') == 'full':
-                text = f'Estimated · {duration.lower()} to full'
-            else:
-                text = f'Estimated · {duration.lower()} left'
-        elif battery.get('estimate_state') == 'collecting':
-            text = 'Estimating time remaining…'
-        else:
-            text = 'Time estimate unavailable'
-        self.battery_time.set_label(text)
-        self.battery_time.set_tooltip_text({'android': 'Estimated by Android. Charging slows as the battery fills.',
-            'charge_counter': 'Based on remaining charge and recent battery current. Time changes with phone usage.',
-            'battery_trend': 'Based on the measured battery level trend. Time changes with phone usage.'}.get(battery.get('estimate_source')))
+        self.battery_power.set_label(f'{"Charging" if watts < 0 else "Power draw"} · {abs(watts):.2f} W' if valid_power else 'Power draw unavailable')
 
     def render_notifications(self, notifications):
         if notifications == self.last_notifications:
@@ -1711,7 +2101,8 @@ class Window(Adw.ApplicationWindow):
             if not meta['quiet']:
                 self.error(op.get('error') or 'Operation failed')
         elif not meta['quiet']:
-            self.toasts.add_toast(Adw.Toast(title='Operation completed'))
+            self.toasts.add_toast(Adw.Toast(title=result.get('reason', 'Operation completed')
+                                          if op['feature'] == 'samsung_routines' else 'Operation completed'))
 
     def load_messages(self, force=False, address=None, offset=0, append=False):
         if not self.enabled('sms') or (self.messages_loaded and not force and address is None and not append):
@@ -1865,27 +2256,42 @@ class Window(Adw.ApplicationWindow):
             self.photo_status.set_label('Photos could not be loaded. Try Refresh.')
             return
         self.clear(self.photos)
+        self.gallery_copy_supported = bool(result.get('clipboard_supported'))
         self.photo_items, self.photo_widgets, self.preview_queue = {}, {}, []
         # A refreshed list expires Android's old selection tokens; pending responses
         # may finish, but only tokens in the current gallery can update a tile.
-        for item in result.get('items', [])[:30]:
+        for item in result.get('items', [])[:60]:
             key = item['id']
             self.photo_items[key] = item
             button = Gtk.Button(tooltip_text=item.get('name', 'Photo'))
             button.add_css_class('photo-tile')
             button.set_overflow(Gtk.Overflow.HIDDEN)
             button.connect('clicked', lambda _, k=key: self.open_photo(k))
+            context = Gtk.GestureClick(button=3)
+            context.connect('released', lambda gesture, count, x, y, b=button, k=key: self.photo_menu(b, k, x, y))
+            button.add_controller(context)
+            keyboard = Gtk.EventControllerKey()
+            keyboard.connect('key-pressed', lambda controller, value, code, state, b=button, k=key:
+                (self.photo_menu(b, k) or True) if value == Gdk.KEY_Menu or value == Gdk.KEY_F10 and state & Gdk.ModifierType.SHIFT_MASK else False)
+            button.add_controller(keyboard)
             tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, width_request=156)
             stack = Gtk.Stack(height_request=144, hexpand=True)
             picture = ThumbnailPicture(content_fit=Gtk.ContentFit.COVER, can_shrink=True)
             stack.add_named(picture, 'image')
             placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
-            placeholder.append(Gtk.Image(icon_name='image-x-generic-symbolic', pixel_size=32))
+            placeholder.append(Gtk.Image(icon_name='video-x-generic-symbolic' if item.get('kind') == 'video' else 'image-x-generic-symbolic', pixel_size=32))
             hint = label('Loading preview…', 'dim-label')
             hint.add_css_class('caption')
             placeholder.append(hint)
             stack.add_named(placeholder, 'empty')
-            tile.append(stack)
+            overlay = Gtk.Overlay(child=stack)
+            if item.get('kind') == 'video':
+                badge = Gtk.Box(spacing=4, halign=Gtk.Align.END, valign=Gtk.Align.END, margin_end=6, margin_bottom=6)
+                badge.add_css_class('osd')
+                badge.append(Gtk.Image(icon_name='media-playback-start-symbolic'))
+                badge.append(label(self.playback_time(item.get('duration', 0))))
+                overlay.add_overlay(badge)
+            tile.append(overlay)
             info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             info.add_css_class('photo-info')
             name = label(item.get('name', 'Photo'), ellipsize=Pango.EllipsizeMode.MIDDLE)
@@ -1896,17 +2302,32 @@ class Window(Adw.ApplicationWindow):
             info.append(caption)
             tile.append(info)
             button.set_child(tile)
+            drag = Gtk.DragSource(actions=Gdk.DragAction.COPY)
+            drag.connect('prepare', lambda source, x, y, k=key: self.prepare_gallery_drag(source, k))
+            button.add_controller(drag)
+            button.set_tooltip_text(item.get('name', 'Photo') + '\nDrag to copy the original into another app or folder.')
             self.photos.insert(button, -1)
-            self.photo_widgets[key] = {'stack': stack, 'picture': picture, 'hint': hint, 'texture': None}
+            self.photo_widgets[key] = {'stack': stack, 'picture': picture, 'hint': hint, 'texture': None, 'drag': drag}
             if result.get('preview_supported'):
                 self.preview_queue.append(key)
             else:
                 hint.set_label('Preview unavailable')
         count = len(self.photo_items)
         self.photos_empty.set_visible(not count)
-        self.photo_status.set_label(f'{count} recent photos' if result.get('preview_supported') else
-            'Update the Android companion to load low-resolution previews.' if count else 'No photos available. Check photo access on your phone.')
+        self.photo_status.set_label(f'{count} photos and videos' if result.get('preview_supported') else
+            'Update the Android companion to load low-resolution previews.' if count else 'No photos or videos available. Check gallery access on your phone.')
         self.pump_previews()
+
+    def prepare_gallery_drag(self, source, key):
+        if key not in self.photo_items or not self.enabled('photos') or not self.enabled('files'):
+            return None
+        if self.photo_items[key].get('size', 0) > MAX_FILE:
+            self.error('This file exceeds Unity’s 64 MiB transfer limit.')
+            return None
+        texture = self.photo_widgets[key]['texture']
+        if texture:
+            source.set_icon(texture, 0, 0)
+        return GalleryDragProvider(self, key)
 
     def pump_previews(self):
         if self.stack.get_visible_child_name() != 'photos' or not self.enabled('photos'):
@@ -1948,12 +2369,52 @@ class Window(Adw.ApplicationWindow):
         info.append(label('Low-resolution preview · Download for original quality', 'dim-label', wrap=True))
         download = Gtk.Button(label='Download original', halign=Gtk.Align.END)
         download.add_css_class('suggested-action')
-        download.set_sensitive(self.enabled('photos'))
-        download.connect('clicked', lambda *_: self.execute('photos', 'get', {'id': key}))
-        info.append(download)
+        download.set_sensitive(self.enabled('photos') and self.enabled('files'))
+        download.connect('clicked', lambda *_: self.gallery_action(key, 'get'))
+        actions = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        copy = Gtk.Button(label='Copy to clipboard', sensitive=self.enabled('photos') and self.enabled('files') and self.gallery_copy_supported)
+        copy.connect('clicked', lambda *_: self.gallery_action(key, 'copy'))
+        actions.append(copy); actions.append(download)
+        info.append(actions)
         box.append(info)
         dialog.set_child(box)
         dialog.present(self)
+
+    def photo_menu(self, button, key, x=None, y=None):
+        if key not in self.photo_items:
+            return
+        popover = Gtk.Popover(autohide=True)
+        popover.set_parent(button)
+        if x is not None:
+            rect = Gdk.Rectangle(); rect.x = int(x); rect.y = int(y); rect.width = rect.height = 1
+            popover.set_pointing_to(rect)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+        for title, action in [('Copy to clipboard', 'copy'), ('Download original', 'get')]:
+            control = Gtk.Button(label=title, sensitive=self.enabled('photos') and self.enabled('files') and (action != 'copy' or self.gallery_copy_supported))
+            if action == 'copy' and not self.gallery_copy_supported: control.set_tooltip_text('Update the Android companion to copy original files.')
+            control.add_css_class('flat')
+            control.connect('clicked', lambda _, a=action: (popover.popdown(), self.gallery_action(key, a)))
+            box.append(control)
+        popover.set_child(box)
+        popover.connect('closed', lambda *_: popover.unparent())
+        popover.popup()
+
+    def gallery_action(self, key, action):
+        if key not in self.photo_items or not self.enabled('photos') or not self.enabled('files'):
+            return
+        if action == 'copy' and not self.gallery_copy_supported:
+            self.error('Update the Android companion to copy gallery originals.')
+            return
+        name = self.photo_items[key].get('name', 'Gallery item')
+        self.photo_status.set_label(f'Downloading {name}' + (' for the clipboard…' if action == 'copy' else '…'))
+        def finished(result):
+            if result is None:
+                self.photo_status.set_label('Could not download this item. Check the connection and try again.')
+            elif action == 'copy':
+                self.photo_status.set_label('File copied. Its temporary copy is removed when the clipboard changes.')
+            else:
+                self.photo_status.set_label(f'Downloaded {name}. Your original download is kept.')
+        self.execute('photos', action, {'id': key}, done=finished)
 
     def show_browser(self, result):
         if result is None:
@@ -1975,24 +2436,147 @@ class Window(Adw.ApplicationWindow):
         seconds = max(0, int(ms or 0)) // 1000
         return f'{seconds // 60}:{seconds % 60:02}'
 
+    def render_sound(self, state):
+        self.sound_state = state
+        for source, widgets in self.sound_widgets.items():
+            sound = state.get('desktop_sound' if source == 'desktop' else 'sound', {})
+            allowed = bool(self.enabled('sound') and sound.get('available') and sound.get('origin') == source)
+            pending = self.sound_pending.get(source)
+            target = (self.path, self.generation, sound.get('output'))
+            if pending and (not allowed or pending['target'] != target):
+                GLib.source_remove(pending['timer'])
+                self.sound_pending.pop(source, None)
+                pending = None
+            widgets['scale'].set_sensitive(allowed)
+            widgets['mute'].set_sensitive(allowed)
+            if not pending: widgets['scale'].set_value(sound.get('volume', 0))
+            widgets['level'].set_label(('>100%' if sound.get('boosted') else str(sound.get('volume', 0)) + '%') if sound else 'Unavailable')
+            widgets['hint'].set_label(sound.get('error') or sound.get('name') or 'Connect and enable Media and sound controls on your phone.')
+            widgets['mute'].set_icon_name('audio-volume-muted-symbolic' if sound.get('muted') else 'audio-volume-high-symbolic')
+            widgets['mute'].set_tooltip_text(('Unmute' if sound.get('muted') else 'Mute') + (' laptop' if source == 'desktop' else ' phone'))
+        self.get_application().update_desktop()
+
+    def change_sound(self, scale, scroll, value, source):
+        if not scale.get_sensitive(): return True
+        sound = self.sound_state.get('desktop_sound' if source == 'desktop' else 'sound', {})
+        target = (self.path, self.generation, sound.get('output'))
+        old = self.sound_pending.pop(source, None)
+        if old: GLib.source_remove(old['timer'])
+        percent = int(round(max(0, min(100, value))))
+        self.sound_widgets[source]['level'].set_label(str(percent) + '%')
+        def submit():
+            pending = self.sound_pending.pop(source, None)
+            current = self.sound_state.get('desktop_sound' if source == 'desktop' else 'sound', {})
+            if pending and pending['target'] == (self.path, self.generation, current.get('output')):
+                payload = {'source': source, 'volume': percent}
+                if source == 'desktop': payload['output'] = current.get('output', '')
+                self.execute('sound', 'volume', payload, quiet=True)
+            return False
+        timer = GLib.timeout_add(160, submit)
+        self.sound_pending[source] = {'timer': timer, 'target': target}
+        return False
+
+    def mute_sound(self, source):
+        pending = self.sound_pending.pop(source, None)
+        if pending: GLib.source_remove(pending['timer'])
+        sound = self.sound_state.get('desktop_sound' if source == 'desktop' else 'sound', {})
+        if not self.enabled('sound') or not sound.get('available'): return
+        payload = {'source': source, 'muted': not sound.get('muted', False)}
+        if source == 'desktop': payload['output'] = sound.get('output', '')
+        self.execute('sound', 'mute', payload, quiet=True)
+
+    def render_media_sources(self, state):
+        phone = state.get('media', {})
+        phones = phone.get('players') if 'players' in phone else ([phone] if phone.get('active', bool(phone.get('title'))) else [])
+        players = [dict(p, origin='phone') for p in (phones or []) if p.get('origin', 'phone') == 'phone']
+        players += [dict(p) for p in state.get('desktop_media', {}).get('players', []) if p.get('origin') == 'desktop']
+        self.media_players = players
+        key = lambda p: (p.get('origin'), p.get('session', ''))
+        selected = next((p for p in players if key(p) == self.media_selection), None)
+        if selected is None:
+            selected = next((p for p in players if p.get('playing')), players[0] if players else {})
+        self.media_selection = key(selected) if selected else None
+        signature = [(key(p), p.get('app_name') or p.get('package')) for p in players]
+        self.media_picker_updating = True
+        if signature != self.media_model_signature:
+            names = [('Laptop' if p.get('origin') == 'desktop' else 'Phone') + ' · ' + (p.get('app_name') or p.get('package') or 'Media player') for p in players]
+            self.media_picker.set_model(Gtk.StringList.new(names or ['No active players']))
+            self.media_model_signature = signature
+        if selected: self.media_picker.set_selected(next(i for i,p in enumerate(players) if key(p) == self.media_selection))
+        self.media_picker.set_sensitive(bool(players))
+        self.media_picker_updating = False
+        self.render_media(selected)
+
+    def select_media_player(self, *_):
+        if self.media_picker_updating: return
+        index = self.media_picker.get_selected()
+        if index < len(self.media_players):
+            player = self.media_players[index]
+            self.media_selection = (player.get('origin'), player.get('session', ''))
+            self.render_media(player)
+
+    def media_action(self, action, data=None, quiet=False):
+        player = self.media_state
+        payload = dict(data or {})
+        if player.get('session'): payload['session'] = player['session']
+        if action == 'seek' and player.get('origin') == 'desktop': payload['track_id'] = player.get('track_id', '')
+        feature = 'desktop_media' if player.get('origin') == 'desktop' else 'media'
+        self.execute(feature, action, payload, quiet=quiet)
+
+    @staticmethod
+    def media_track_key(media):
+        return (media.get('origin'), media.get('session'), media.get('track_id') or
+                (media.get('title'), media.get('artist'), media.get('album')))
+
+    def start_media_clock(self):
+        if self.media_tick_source is None:
+            self.media_tick_source = GLib.timeout_add(250, self.tick_media)
+
+    def stop_media_clock(self):
+        if self.media_tick_source is not None:
+            GLib.source_remove(self.media_tick_source)
+            self.media_tick_source = None
+
+    def tick_media(self):
+        media = self.media_state
+        duration = max(0, media.get('duration', 0))
+        advanced = (time.monotonic() - self.media_sample_at) * 1000 * max(0, min(4, media.get('speed', 1))) if media.get('playing') else 0
+        position = max(0, media.get('position', 0) + advanced)
+        if duration: position = min(position, duration)
+        if not self.pending_seek:
+            self.media_seek.set_value(position)
+            self.media_elapsed.set_label(self.playback_time(position))
+        if self.media_waiting.get_visible(): self.media_waiting.pulse()
+        return GLib.SOURCE_CONTINUE
+
     def render_media(self, media):
-        if not media and self.pending_seek:
+        old = self.media_state
+        media = dict(media)
+        same_track = bool(media and old and self.media_track_key(old) == self.media_track_key(media))
+        if same_track and not media.get('duration') and old.get('duration'):
+            media['duration'] = old['duration']
+        if same_track and not media.get('artwork') and old.get('artwork'):
+            media['artwork'] = old['artwork']
+        if self.pending_seek and (not media or (old.get('origin'), old.get('session'), old.get('track_id')) != (media.get('origin'), media.get('session'), media.get('track_id'))):
             GLib.source_remove(self.pending_seek)
             self.pending_seek = None
         self.media_state = media
+        self.media_sample_at = time.monotonic()
         self.media_title.set_label(media.get('title') or 'Nothing playing')
-        self.media_artist.set_label(media.get('artist') or ('Unknown artist' if media.get('title') else 'Start playback on your phone.'))
+        self.media_artist.set_label(media.get('artist') or ('Unknown artist' if media.get('title') else 'Start playback on your laptop or phone.'))
         self.media_album.set_label(media.get('album', ''))
         self.media_album.set_visible(bool(media.get('album')))
-        self.media_source.set_label(media.get('app_name') or media.get('package') or 'Phone media')
+        self.media_source.set_label(('Laptop' if media.get('origin') == 'desktop' else 'Phone') + ' · ' + (media.get('app_name') or media.get('package') or 'Media'))
         artwork = media.get('artwork')
         art_key = artwork.get('data') if artwork else None
         if art_key != self.art_key:
             self.art_key = art_key
-            self.art_picture.set_paintable(image_texture(artwork))
+            self.art_picture.set_paintable(image_texture(artwork, media=True))
         self.art_stack.set_visible_child_name('image' if self.art_picture.get_paintable() else 'empty')
         duration = media.get('duration', 0)
         position = min(media.get('position', 0), duration) if duration else media.get('position', 0)
+        self.media_seek.set_visible(bool(duration))
+        self.media_waiting.set_visible(bool(media.get('active', bool(media.get('title'))) and not duration))
         self.media_seek.set_range(0, max(1, duration))
         self.media_seek.set_value(position)
         self.media_elapsed.set_label(self.playback_time(position))
@@ -2001,6 +2585,7 @@ class Window(Adw.ApplicationWindow):
         self.media_toggle.set_icon_name('media-playback-pause-symbolic' if media.get('playing') else 'media-playback-start-symbolic')
         self.media_toggle.set_tooltip_text('Pause' if media.get('playing') else 'Play')
         self.update_media_controls()
+        self.get_application().update_desktop()
 
     def update_media_controls(self):
         media = self.media_state
@@ -2008,14 +2593,14 @@ class Window(Adw.ApplicationWindow):
         allowed = media.get('actions')
         for button, action in [(self.media_previous, 'previous'), (self.media_next, 'next'),
                                (self.media_toggle, 'pause' if media.get('playing') else 'play'), (self.media_seek, 'seek')]:
-            button.set_sensitive(bool(self.enabled('media') and active and (allowed is None or action in allowed) and
+            button.set_sensitive(bool(self.enabled('desktop_media' if media.get('origin') == 'desktop' else 'media') and active and (allowed is None or action in allowed) and
                 (action != 'seek' or media.get('duration', 0) > 0)))
 
     def start_screen(self, source):
         if source == 'phone':
             self.open_screen_viewer()
         options = {'source': source}
-        if source == 'desktop': options.update(control=self.screen_control_switch.get_active(), blank_display=self.screen_blank_switch.get_active())
+        if source == 'desktop': options.update(control=self.screen_control_switch.get_active(), blank_display=self.screen_blank_switch.get_active(), extend_display=self.screen_extend_switch.get_active())
         self.execute('screen', 'start', options)
 
     def toggle_laptop_display(self, *_):
@@ -2088,60 +2673,107 @@ class Window(Adw.ApplicationWindow):
         self.laptop_display_button.set_label('Turn off' if screen.get('display_on', True) else 'Turn on')
         self.laptop_display_button.set_sensitive(self.enabled('screen') and desktop and screen.get('state') == 'streaming' and screen.get('display_available', False))
         self.screen_control_switch.set_sensitive(not active)
+        self.screen_extend_switch.set_sensitive(not active)
         self.screen_blank_switch.set_sensitive(not active and self.screen_control_switch.get_active())
         self.screen_status.set_title(('Sharing computer screen' if screen.get('source') == 'desktop' else 'Viewing phone screen') if active else 'No screen share')
-        self.screen_status.set_subtitle(screen.get('error') or screen.get('display_error') or ('Laptop display is off; restore it here or on the phone.' if desktop and not screen.get('display_on', True) else 'Approve capture on the sharing device…' if screen.get('state') == 'starting' else
+        self.screen_status.set_subtitle(screen.get('error') or screen.get('display_error') or ('Phone is a separate monitor beside the laptop display. Move windows between them in your desktop display settings.' if desktop and screen.get('extended_display') else 'Phone is the primary display; the laptop panel is disabled.' if desktop and screen.get('phone_primary') else 'Laptop display is off; restore it here or on the phone.' if desktop and not screen.get('display_on', True) else 'Approve capture on the sharing device…' if screen.get('state') == 'starting' else
             'Live · Close the viewer or press Stop to end sharing.' if active else 'Enable Screen sharing in the Android Features page, then connect.'))
         if active and screen.get('source') == 'phone' and not self.screen_viewer:
             self.open_screen_viewer()
         if self.screen_picture and (not active or self.screen_viewer_path != self.path):
             self.screen_picture.set_paintable(None)
+        self.get_application().update_desktop()
+
+    def render_find_phone(self, state):
+        self.find_state = state
+        self.find_button.set_label('Stop' if state.get('state') == 'ringing' else 'Ring')
+        self.get_application().update_desktop()
+
+    def toggle_find_phone(self, *_):
+        target = (self.path, self.generation)
+        def finished(result):
+            if result is not None and (self.path, self.generation) == target:
+                self.render_find_phone(result)
+        self.execute('find', 'stop' if self.find_state.get('state') == 'ringing' else 'ring', done=finished)
 
     def render_audio_route(self, audio):
         self.audio_state = audio
         active = audio.get('state') in ('starting', 'streaming')
+        source = audio.get('source', 'desktop')
+        if self.audio_pending and self.audio_pending_operation == 'start' and active:
+            self.audio_pending = False
         self.audio_updating = True
         if not self.audio_pending:
-            self.audio_route.set_active(active)
+            self.audio_route.set_active(active and source == 'desktop')
+            self.phone_audio_route.set_active(active and source == 'phone')
         self.audio_updating = False
-        self.audio_route.set_sensitive(self.enabled('audio') and not self.audio_pending)
-        if audio.get('error'):
-            subtitle = audio['error']
-        elif active:
-            subtitle = ('Connecting audio…' if audio.get('state') == 'starting' else
-                        'Laptop sound plays on the phone. Turn off to restore laptop output.')
-        elif self.enabled('audio'):
-            subtitle = 'Send laptop sound to your phone over the encrypted connection.'
-        else:
-            cap = self.capabilities.get('audio', {})
-            subtitle = ('Update the Android companion to enable audio routing.' if cap.get('status') == 'unsupported' else
-                        'Enable Laptop audio on phone in the Android Features page, then connect.')
-        self.audio_route.set_subtitle(subtitle)
+        self.audio_transport.set_sensitive(self.enabled('audio') and not active and not self.audio_pending)
+        transport = {'lan': 'Wi-Fi / LAN', 'bluetooth': 'Bluetooth'}.get(audio.get('transport'), 'encrypted connection')
+        for row, direction in ((self.audio_route, 'desktop'), (self.phone_audio_route, 'phone')):
+            row.set_sensitive(self.enabled('audio') and not self.audio_pending and (not active or source == direction))
+            if audio.get('error') and source == direction:
+                subtitle = audio['error']
+            elif active and source == direction:
+                if audio.get('state') == 'starting':
+                    subtitle = ('Approve audio sharing on your phone…' if source == 'phone' else 'Connecting audio…')
+                else:
+                    subtitle = ('Phone media plays on this laptop.' if source == 'phone' else
+                                'Laptop sound plays on the phone. Turn off to restore laptop output.')
+                subtitle += f' Using {transport}.'
+                phone = self.sound_state.get('sound', {})
+                if source == 'desktop' and phone.get('available') and phone.get('origin') == 'phone':
+                    if phone.get('muted'):
+                        subtitle += ' Phone media is muted; unmute it under Device volume.'
+                    elif phone.get('volume') == 0:
+                        subtitle += ' Phone media volume is 0%; raise it under Device volume.'
+            elif self.enabled('audio'):
+                subtitle = ('Send laptop sound to your phone using the selected connection.' if direction == 'desktop' else
+                            'Approve media audio capture on the phone each time. Some apps block capture; phone speakers may also play.')
+                if active:
+                    subtitle = 'Stop the current audio stream to change direction.'
+            else:
+                cap = self.capabilities.get('audio', {})
+                subtitle = ('Update the Android companion to enable audio routing.' if cap.get('status') == 'unsupported' else
+                            'Enable Phone and laptop audio in the Android Features page, then connect.')
+            row.set_subtitle(subtitle)
+        self.get_application().update_desktop()
 
     def toggle_audio_route(self, row, _):
         if self.audio_updating or self.audio_pending:
+            return
+        self.request_audio_route('phone' if row is self.phone_audio_route else 'desktop', row.get_active())
+
+    def request_audio_route(self, source, active):
+        if self.audio_pending or source not in ('phone', 'desktop'):
             return
         if not self.enabled('audio'):
             self.render_audio_route(self.audio_state)
             return
         self.audio_pending = True
-        row.set_sensitive(False)
+        self.audio_route.set_sensitive(False)
+        self.phone_audio_route.set_sensitive(False)
+        self.audio_transport.set_sensitive(False)
+        self.audio_pending_operation = 'start' if active else 'stop'
+        transport = ('auto', 'lan', 'bluetooth')[min(self.audio_transport.get_selected(), 2)]
         def finished(result):
             self.audio_pending = False
             self.render_audio_route(self.audio_state)
             self.refresh()
-        self.execute('audio', 'start' if row.get_active() else 'stop', done=finished)
+        self.execute('audio', 'start' if active else 'stop',
+                     {'source': source, 'transport': transport} if active else {}, done=finished)
 
     def toggle_media(self, *_):
-        self.execute('media', 'pause' if self.media_state.get('playing') else 'play')
+        self.media_action('pause' if self.media_state.get('playing') else 'play')
 
     def seek_media(self, scale, scroll, value):
-        if self.enabled('media') and scale.get_sensitive():
-            if self.pending_seek:
-                GLib.source_remove(self.pending_seek)
+        if scale.get_sensitive():
+            if self.pending_seek: GLib.source_remove(self.pending_seek)
+            player = dict(self.media_state)
+            position = int(max(0, min(value, player.get('duration', 0))))
             def submit():
                 self.pending_seek = None
-                self.execute('media', 'seek', {'position': int(max(0, min(value, self.media_state.get('duration', 0))))}, quiet=True)
+                if (player.get('origin'), player.get('session'), player.get('track_id')) == (self.media_state.get('origin'), self.media_state.get('session'), self.media_state.get('track_id')):
+                    self.media_action('seek', {'position': position}, quiet=True)
                 return False
             self.pending_seek = GLib.timeout_add(200, submit)
         return False
@@ -2293,7 +2925,7 @@ class Window(Adw.ApplicationWindow):
         bluetooth = info.get('bluetooth', {})
         addresses = [a.get('address', '') for a in bluetooth.get('adapters', []) if a.get('powered')]
         bt_text = 'Bluetooth: ' + ', '.join(addresses) if addresses else 'Bluetooth: ' + (bluetooth.get('reason') or 'Turn on Bluetooth in system settings')
-        self.pair_info.set_label(f"{bt_text}\nPort: {info['port']}\nCompare this TLS fingerprint on the phone:\n{info['fingerprint']}")
+        self.pair_info.set_label(f"{bt_text}\nPorts: {', '.join(str(p) for p in info.get('network', {}).get('ports', [info['port']]))}\nEncrypted address discovery over the paired connection.\nCompare this TLS fingerprint on the phone:\n{info['fingerprint']}")
         self.clear(self.pair_requests)
         for pending in info['pending']:
             row = Adw.ActionRow(title=pending['name'], subtitle=pending['id'])
@@ -2314,30 +2946,769 @@ class Window(Adw.ApplicationWindow):
         dialog.present(self)
 
 
+class StatusIndicator:
+    """GTK4-compatible AppIndicator, using the session bus and the app's actions.
+
+    GNOME's AppIndicator extension renders the popup; no GTK3 library or helper
+    process is needed. Item IDs remain stable across updates and are never reused
+    for another device, so a click from an old popup cannot control a new phone.
+    """
+    ITEM_PATH = '/StatusNotifierItem'
+    MENU_PATH = '/org/unityconnect/IndicatorMenu'
+    ITEM_IFACE = 'org.kde.StatusNotifierItem'
+    MENU_IFACE = 'com.canonical.dbusmenu'
+    WATCHER = 'org.kde.StatusNotifierWatcher'
+    XML = '''<node>
+      <interface name="org.kde.StatusNotifierItem">
+        <property name="Category" type="s" access="read"/>
+        <property name="Id" type="s" access="read"/>
+        <property name="Title" type="s" access="read"/>
+        <property name="Status" type="s" access="read"/>
+        <property name="WindowId" type="i" access="read"/>
+        <property name="IconName" type="s" access="read"/>
+        <property name="IconThemePath" type="s" access="read"/>
+        <property name="IconPixmap" type="a(iiay)" access="read"/>
+        <property name="OverlayIconName" type="s" access="read"/>
+        <property name="OverlayIconPixmap" type="a(iiay)" access="read"/>
+        <property name="AttentionIconName" type="s" access="read"/>
+        <property name="AttentionIconPixmap" type="a(iiay)" access="read"/>
+        <property name="AttentionMovieName" type="s" access="read"/>
+        <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+        <property name="ItemIsMenu" type="b" access="read"/>
+        <property name="Menu" type="o" access="read"/>
+        <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+        <method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+        <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+        <method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
+        <method name="ProvideXdgActivationToken"><arg type="s" direction="in"/></method>
+        <signal name="NewToolTip"/>
+      </interface>
+      <interface name="com.canonical.dbusmenu">
+        <property name="Version" type="u" access="read"/>
+        <property name="TextDirection" type="s" access="read"/>
+        <property name="Status" type="s" access="read"/>
+        <property name="IconThemePath" type="as" access="read"/>
+        <method name="GetLayout">
+          <arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
+          <arg type="u" direction="out"/><arg type="(ia{sv}av)" direction="out"/>
+        </method>
+        <method name="GetGroupProperties">
+          <arg type="ai" direction="in"/><arg type="as" direction="in"/><arg type="a(ia{sv})" direction="out"/>
+        </method>
+        <method name="GetProperty">
+          <arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/>
+        </method>
+        <method name="Event">
+          <arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/><arg type="u" direction="in"/>
+        </method>
+        <method name="EventGroup"><arg type="a(isvu)" direction="in"/><arg type="ai" direction="out"/></method>
+        <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+        <method name="AboutToShowGroup">
+          <arg type="ai" direction="in"/><arg type="ai" direction="out"/><arg type="ai" direction="out"/>
+        </method>
+        <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+      </interface>
+    </node>'''
+
+    def __init__(self, app):
+        self.app = app
+        self.bus = app.get_dbus_connection()
+        self.ready = self.closed = False
+        self.host_available = False
+        self.owner = self.proxy = None
+        self.activation_token = None
+        self.revision = 0
+        self.ids, self.nodes = {}, {0: ({}, [], None, None)}
+        self.signature = None
+        self.description = 'Unity'
+        info = Gio.DBusNodeInfo.new_for_xml(self.XML)
+        self.registrations = [self.bus.register_object(path, info.lookup_interface(interface),
+            self.method, self.get_property, None) for path, interface in
+            [(self.ITEM_PATH, self.ITEM_IFACE), (self.MENU_PATH, self.MENU_IFACE)]]
+        self.watch = Gio.bus_watch_name_on_connection(self.bus, self.WATCHER,
+            Gio.BusNameWatcherFlags.NONE, self.appeared, self.vanished)
+
+    def get_property(self, bus, sender, path, interface, name):
+        if interface == self.MENU_IFACE:
+            values = {'Version': ('u', 3), 'TextDirection': ('s', 'ltr'),
+                      'Status': ('s', 'normal'), 'IconThemePath': ('as', [])}
+        else:
+            values = {key: ('s', '') for key in ('IconThemePath', 'OverlayIconName',
+                      'AttentionIconName', 'AttentionMovieName')}
+            values.update({key: ('a(iiay)', []) for key in ('IconPixmap', 'OverlayIconPixmap', 'AttentionIconPixmap')})
+            values.update({'Category': ('s', 'Communications'), 'Id': ('s', 'org.unityconnect.Unity'),
+                'Title': ('s', 'Unity'), 'Status': ('s', 'Active'), 'WindowId': ('i', 0),
+                'IconName': ('s', 'org.unityconnect.Unity-symbolic'), 'ItemIsMenu': ('b', True),
+                'Menu': ('o', self.MENU_PATH),
+                'ToolTip': ('(sa(iiay)ss)', ('org.unityconnect.Unity-symbolic', [], 'Unity', self.description))})
+        return GLib.Variant(*values[name])
+
+    def appeared(self, bus, name, owner):
+        self.owner = owner
+        Gio.DBusProxy.new(bus, Gio.DBusProxyFlags.DO_NOT_AUTO_START, None, owner,
+            '/StatusNotifierWatcher', self.WATCHER, None, self.proxy_created, owner)
+
+    def proxy_created(self, source, result, owner):
+        try:
+            proxy = Gio.DBusProxy.new_finish(result)
+        except GLib.Error:
+            return
+        if self.closed or self.owner != owner:
+            return
+        self.proxy = proxy
+        host = proxy.get_cached_property('IsStatusNotifierHostRegistered')
+        self.host_available = bool(host and host.unpack())
+        proxy.connect('g-signal', self.host_signal)
+        proxy.connect('g-properties-changed', self.host_properties)
+        self.register()
+
+    def host_properties(self, proxy, changed, invalidated):
+        if proxy != self.proxy:
+            return
+        if 'IsStatusNotifierHostRegistered' in changed.unpack() or 'IsStatusNotifierHostRegistered' in invalidated:
+            host = proxy.get_cached_property('IsStatusNotifierHostRegistered')
+            self.host_available = bool(host and host.unpack())
+            self.register()
+
+    def host_signal(self, proxy, sender, name, parameters):
+        if proxy != self.proxy:
+            return
+        if name == 'StatusNotifierHostRegistered':
+            self.host_available = True
+            self.register()
+        elif name == 'StatusNotifierHostUnregistered':
+            self.host_available = False
+            self.set_ready(False)
+
+    def register(self):
+        if not self.host_available:
+            self.set_ready(False)
+            return
+        if self.ready:
+            return
+        owner = self.owner
+        def registered(bus, result):
+            try:
+                bus.call_finish(result)
+            except GLib.Error:
+                return
+            if not self.closed and self.owner == owner and self.host_available:
+                self.set_ready(True)
+        self.bus.call(owner, '/StatusNotifierWatcher', self.WATCHER, 'RegisterStatusNotifierItem',
+            GLib.Variant('(s)', (self.ITEM_PATH,)), None, Gio.DBusCallFlags.NONE, 5000, None, registered)
+
+    def set_ready(self, ready):
+        was_ready, self.ready = self.ready, ready
+        if was_ready and not ready and not self.closed:
+            win = self.app.main_window()
+            if win and not win.get_visible() and not win.popup_only:
+                win.present()
+
+    def vanished(self, *args):
+        self.owner = self.proxy = None
+        self.host_available = False
+        self.set_ready(False)
+
+    def update(self, items, description):
+        signature = (repr(items), description)
+        if signature == self.signature:
+            return
+        self.signature = signature
+        self.description = description
+        nodes = {}
+        def add(item, parent=()):
+            key = (*parent, item['key'])
+            if key not in self.ids:
+                self.ids[key] = len(self.ids) + 1
+            ident = self.ids[key]
+            children = [add(child, key) for child in item.get('children', [])]
+            props = {k: GLib.Variant('b' if isinstance(v, bool) else 'i' if isinstance(v, int) else 's', v)
+                     for k, v in item.get('props', {}).items()}
+            if children: props['children-display'] = GLib.Variant('s', 'submenu')
+            nodes[ident] = (props, children, item.get('action'), item.get('target'))
+            return ident
+        children = [add(item) for item in items]
+        nodes[0] = ({'children-display': GLib.Variant('s', 'submenu')}, children, None, None)
+        self.nodes = nodes
+        self.revision += 1
+        self.bus.emit_signal(None, self.MENU_PATH, self.MENU_IFACE, 'LayoutUpdated', GLib.Variant('(ui)', (self.revision, 0)))
+        self.bus.emit_signal(None, self.ITEM_PATH, self.ITEM_IFACE, 'NewToolTip', None)
+
+    def properties(self, ident, names):
+        props = self.nodes[ident][0]
+        return {key: value for key, value in props.items() if not names or key in names}
+
+    def layout(self, ident, depth, names):
+        children = [] if depth == 0 else [GLib.Variant('(ia{sv}av)', self.layout(child, depth - 1, names))
+                                        for child in self.nodes[ident][1]]
+        return ident, self.properties(ident, names), children
+
+    def event(self, ident, event, data, timestamp):
+        if ident not in self.nodes:
+            return False
+        props, children, action, target = self.nodes[ident]
+        if event == 'clicked' and action and props.get('enabled', GLib.Variant('b', True)).unpack():
+            # GAction also checks current permission/connection state.
+            self.activate(action, target)
+        return True
+
+    def activate(self, action, target=None):
+        win = self.app.main_window()
+        if win and self.activation_token:
+            win.set_startup_id(self.activation_token)
+        self.activation_token = None
+        self.app.activate_action(action, GLib.Variant('s', target) if target is not None else None)
+
+    def method(self, bus, sender, path, interface, method, parameters, invocation):
+        args = parameters.unpack()
+        try:
+            if interface == self.ITEM_IFACE:
+                if method == 'ProvideXdgActivationToken':
+                    self.activation_token = args[0]
+                elif method in ('Activate', 'SecondaryActivate'):
+                    self.activate('show')
+                invocation.return_value(None)
+            elif method == 'GetLayout':
+                invocation.return_value(GLib.Variant('(u(ia{sv}av))', (self.revision, self.layout(*args))))
+            elif method == 'GetGroupProperties':
+                invocation.return_value(GLib.Variant('(a(ia{sv}))', ([(i, self.properties(i, args[1]))
+                    for i in (args[0] or self.nodes) if i in self.nodes],)))
+            elif method == 'GetProperty':
+                invocation.return_value(GLib.Variant('(v)', (self.properties(args[0], [args[1]])[args[1]],)))
+            elif method == 'Event':
+                self.event(*args); invocation.return_value(None)
+            elif method == 'EventGroup':
+                errors = [event[0] for event in args[0] if not self.event(*event)]
+                invocation.return_value(GLib.Variant('(ai)', (errors,)))
+            elif method == 'AboutToShow':
+                invocation.return_value(GLib.Variant('(b)', (False,)))
+            elif method == 'AboutToShowGroup':
+                invocation.return_value(GLib.Variant('(aiai)', ([], [i for i in args[0] if i not in self.nodes])))
+        except (KeyError, ValueError) as error:
+            invocation.return_dbus_error(self.MENU_IFACE + '.InvalidItem', str(error))
+
+    def close(self):
+        self.closed = True
+        Gio.bus_unwatch_name(self.watch)
+        for registration in self.registrations:
+            self.bus.unregister_object(registration)
+
+
 class App(Adw.Application):
+    PAGE_TITLES = {'overview': 'Overview', 'notifications': 'Notifications', 'messages': 'Messages',
+        'calls': 'Calls', 'files': 'Files', 'photos': 'Photos', 'connectivity': 'Connectivity',
+        'media': 'Media', 'remote': 'Remote Control', 'firefox': 'Firefox', 'settings': 'Settings'}
+    MENU_TITLES = {'file': 'File', 'phone': 'Phone', 'media': 'Media', 'screen': 'Screen',
+                   'view': 'View', 'settings': 'Settings', 'help': 'Help'}
+    DEFAULT_PREFERENCES = {'keep_running': True, 'show_status': True, 'appearance': 'system', 'audio_transport': 'auto'}
+    FEATURE_TITLES = {'sms': 'Text Messages', 'urls': 'Link Sharing', 'find': 'Find Phone', 'files': 'File Transfers',
+        'browsing': 'Browse Phone Files', 'photos': 'Photos and Videos', 'audio': 'Audio Streaming',
+        'media': 'Phone Playback Controls', 'desktop_media': 'Laptop Playback Controls', 'sound': 'Device Volume',
+        'screen': 'Screen Sharing', 'remote_input': 'Remote Input', 'lock': 'Lock Phone', 'ringer': 'Phone Ringer and DND',
+        'clipboard': 'Automatic Clipboard Sync', 'notifications': 'Phone Notifications',
+        'notification_actions': 'Notification Actions', 'call_notifications': 'Call Notifications', 'call_control': 'Call Controls',
+        'samsung_routines': 'Samsung Routines', 'phone_connectivity': 'Phone Connections', 'hotspot': 'Internet Sharing',
+        'media_artwork': 'Media Artwork'}
+
     def __init__(self):
         super().__init__(application_id='org.unityconnect.Unity', flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.indicator = None
+        self.desktop_source = None
+        self.preferences = dict(self.DEFAULT_PREFERENCES)
+        self.menu_signatures = {}
+        self.feature_actions = {}
+        self.feature_pending = set()
         self.add_main_option('call-popup', 0, GLib.OptionFlags.NONE, GLib.OptionArg.STRING, 'Show call controls for a phone', 'DEVICE')
         self.add_main_option('open-messages', 0, GLib.OptionFlags.NONE, GLib.OptionArg.STRING, 'Open messages for a phone', 'DEVICE')
         self.add_main_option('open-notifications', 0, GLib.OptionFlags.NONE, GLib.OptionArg.STRING, 'Open notifications for a phone', 'DEVICE')
 
     def do_startup(self):
         Adw.Application.do_startup(self)
-        quit_action = Gio.SimpleAction.new('quit', None)
-        quit_action.connect('activate', lambda *_: self.quit())
-        self.add_action(quit_action)
-        self.set_accels_for_action('app.quit', ['<primary>q'])
+        self.load_preferences()
+        for name, callback, accel in [
+                ('quit', lambda: self.quit(), '<primary>q'),
+                ('show', self.activate, '<primary>o'),
+                ('send-files', self.send_files, '<primary>u'),
+                ('find-phone', lambda: self.main_window().toggle_find_phone(), '<primary>f'),
+                ('stop-screen', lambda: self.main_window().execute('screen', 'stop'), None),
+                ('refresh', lambda: self.main_window().changed(ROOT), '<primary>r'),
+                ('discover', self.discover, None),
+                ('about', self.show_about, None)]:
+            action = Gio.SimpleAction.new(name, None)
+            action.connect('activate', lambda action, parameter, callback=callback: callback())
+            self.add_action(action)
+            if accel: self.set_accels_for_action('app.' + name, [accel])
+        for page in self.PAGE_TITLES:
+            action = Gio.SimpleAction.new('page-' + page, None)
+            action.connect('activate', lambda action, parameter, page=page: self.show_page(page))
+            self.add_action(action)
+        self.set_accels_for_action('app.page-settings', ['<primary>comma'])
+        device = Gio.SimpleAction.new_stateful('device', GLib.VariantType.new('s'), GLib.Variant('s', ''))
+        device.connect('activate', self.select_device)
+        device.connect('change-state', self.select_device)
+        self.add_action(device)
+        self.add_quick_actions()
+        menu = Gio.Menu()
+        self.menu_models = {key: Gio.Menu() for key in self.MENU_TITLES}
+        for key, title in self.MENU_TITLES.items(): menu.append_submenu(title, self.menu_models[key])
+        self.set_menubar(menu)
+        if self.get_dbus_connection():
+            self.indicator = StatusIndicator(self)
+        self.connect('window-removed', lambda *_: self.update_desktop())
         self.connect('window-added', self.add_file_drop_target)
+        self.update_desktop()
         # Let GApplication release its registration when a launcher/session
         # manager terminates the window, just as it does for a normal close.
         GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM,
                            lambda: (self.quit(), False)[1])
 
     def do_activate(self):
-        win = next((w for w in self.get_windows() if isinstance(w, Window)), None)
+        win = self.main_window()
         if not win:
             win = Window(self)
+        win.popup_only = False
         win.present()
+        self.update_desktop()
+
+    def main_window(self):
+        return next((w for w in self.get_windows() if isinstance(w, Window)), None)
+
+    def keep_in_background(self, win):
+        return bool(self.preferences['keep_running'] and self.indicator and self.indicator.ready and not win.popup_only)
+
+    def show_page(self, page):
+        self.activate()
+        win = self.main_window()
+        win.nav.select_row(win.pages[page])
+
+    def send_files(self):
+        self.show_page('files')
+        self.main_window().choose_file()
+
+    def discover(self):
+        self.show_page('settings')
+        self.main_window().discover()
+
+    def show_about(self):
+        self.activate()
+        Adw.AboutDialog(application_name='Unity', application_icon='org.unityconnect.Unity',
+            comments='Connect with your phone. Local. Private. Connected.',
+            website='https://github.com/MukhilDharan5/Unity_Linux', license_type=Gtk.License.GPL_3_0).present(self.main_window())
+
+    def select_device(self, action, target):
+        win = self.main_window()
+        path = target.unpack()
+        if win and path in win.devices:
+            win.device_dropdown.set_selected(list(win.devices).index(path))
+            self.update_desktop()
+
+    def load_preferences(self):
+        self.preference_path = Path(GLib.get_user_config_dir()) / 'unity/desktop.json'
+        try:
+            saved = json.loads(self.preference_path.read_text())
+            if isinstance(saved, dict):
+                for key, default in self.DEFAULT_PREFERENCES.items():
+                    value = saved.get(key, default)
+                    if self.valid_preference(key, value): self.preferences[key] = value
+        except (OSError, ValueError):
+            pass
+        self.apply_appearance()
+
+    @staticmethod
+    def valid_preference(key, value):
+        return (type(value) is bool if key in ('keep_running', 'show_status') else
+                value in ('system', 'light', 'dark') if key == 'appearance' else
+                value in ('auto', 'lan', 'bluetooth') if key == 'audio_transport' else False)
+
+    def apply_appearance(self):
+        Adw.StyleManager.get_default().set_color_scheme({'system': Adw.ColorScheme.DEFAULT,
+            'light': Adw.ColorScheme.FORCE_LIGHT, 'dark': Adw.ColorScheme.FORCE_DARK}[self.preferences['appearance']])
+
+    def set_preference(self, key, value):
+        if not self.valid_preference(key, value): return
+        if self.preferences[key] != value:
+            updated = dict(self.preferences, **{key: value})
+            try:
+                self.preference_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                Gio.File.new_for_path(str(self.preference_path)).replace_contents(
+                    (json.dumps(updated, indent=2) + '\n').encode(), None, False, Gio.FileCreateFlags.PRIVATE, None)
+            except (OSError, GLib.Error) as error:
+                win = self.main_window()
+                if win: win.error('Could not save desktop settings: ' + str(error))
+                self.update_desktop()
+                return
+            self.preferences = updated
+            self.apply_appearance()
+        if key == 'keep_running' and not value:
+            win = self.main_window()
+            if win and not win.get_visible() and not win.popup_only: win.present()
+        self.update_desktop()
+
+    def add_action_handler(self, name, callback, parameter=None, state=None):
+        parameter_type = GLib.VariantType.new(parameter) if parameter else None
+        action = (Gio.SimpleAction.new_stateful(name, parameter_type, GLib.Variant('b' if type(state) is bool else 's', state))
+                  if state is not None else Gio.SimpleAction.new(name, parameter_type))
+        def activated(action, value):
+            if not action.get_enabled(): return
+            callback(value.unpack() if value is not None else not action.get_state().unpack() if type(state) is bool else None)
+            self.update_desktop()
+        action.connect('activate', activated)
+        if state is not None: action.connect('change-state', activated)
+        self.add_action(action)
+
+    def add_quick_actions(self):
+        handlers = {
+            'share-link': (lambda w, _: self.share_link(), None, None),
+            'new-message': (lambda w, _: (self.show_page('messages'), w.compose_message()), None, None),
+            'browse-files': (lambda w, _: (self.show_page('files'), w.execute('browsing', 'list', {'id': ''}, done=w.show_browser)), None, None),
+            'open-received-file': (lambda w, _: w.open_received_file(), None, None),
+            'lock-phone': (lambda w, _: w.execute('lock', 'lock'), None, None),
+            'hotspot-on': (lambda w, _: w.request_phone_hotspot(True), None, None),
+            'hotspot-off': (lambda w, _: w.request_phone_hotspot(False), None, None),
+            'disconnect-bluetooth': (self.disconnect_bluetooth, 's', None),
+            'refresh-connections': (lambda w, _: w.execute('phone_connectivity', 'refresh'), None, None),
+            'ringer-mode': (lambda w, mode: w.execute('ringer', 'set', {'mode': mode})
+                if mode in ('normal', 'vibrate', 'silent', 'dnd', 'off') else None, 's', ''),
+            'media-play-pause': (lambda w, _: w.toggle_media(), None, None),
+            'media-previous': (lambda w, _: w.media_action('previous'), None, None),
+            'media-next': (lambda w, _: w.media_action('next'), None, None),
+            'media-player': (self.select_player, 's', ''),
+            'audio-start': (self.start_audio, 's', None),
+            'audio-stop': (lambda w, _: w.request_audio_route(w.audio_state.get('source', 'desktop'), False), None, None),
+            'screen-start': (self.start_screen_mode, 's', None),
+            'laptop-display': (lambda w, _: w.toggle_laptop_display(), None, None),
+            'firefox-enabled': (lambda w, desired: w.firefox_switch.set_active(desired), None, False),
+        }
+        for source, prefix in [('phone', 'phone'), ('desktop', 'laptop')]:
+            handlers[prefix + '-muted'] = (lambda w, desired, source=source: self.set_muted(w, source, desired), None, False)
+            for direction, amount in [('up', 10), ('down', -10)]:
+                handlers[prefix + '-volume-' + direction] = (lambda w, _, source=source, amount=amount:
+                    self.change_volume(w, source, amount), None, None)
+        self.quick_handlers = handlers
+        for name, (_, parameter, state) in handlers.items():
+            self.add_action_handler(name, lambda value, name=name: self.run_quick_action(name, value), parameter, state)
+        for action, key in [('keep-running', 'keep_running'), ('show-status', 'show_status'),
+                            ('appearance', 'appearance'), ('audio-transport', 'audio_transport')]:
+            value = self.preferences[key]
+            self.add_action_handler(action, lambda value, key=key: self.set_preference(key, value),
+                                    's' if type(value) is str else None, value)
+        self.set_accels_for_action('app.new-message', ['<primary>n'])
+        self.set_accels_for_action('app.share-link', ['<primary>l'])
+
+    def action_availability(self, win):
+        if win is None or not hasattr(win, 'client'):
+            return {name: False for name in self.quick_handlers}
+        active_screen = win.screen_state.get('state') in ('starting', 'streaming')
+        active_audio = win.audio_state.get('state') in ('starting', 'streaming')
+        available = {'share-link': win.enabled('urls'), 'new-message': win.enabled('sms'),
+            'browse-files': win.enabled('browsing'), 'open-received-file': bool(win.authorized and win.received_path),
+            'lock-phone': win.enabled('lock'), 'hotspot-on': win.enabled('samsung_routines') and not win.hotspot_command_pending,
+            'hotspot-off': win.enabled('samsung_routines') and not win.hotspot_command_pending,
+            'disconnect-bluetooth': win.enabled('samsung_routines') and bool(win.phone_device_rows),
+            'refresh-connections': win.enabled('phone_connectivity'), 'ringer-mode': win.enabled('ringer'),
+            'media-play-pause': win.media_toggle.get_sensitive(), 'media-previous': win.media_previous.get_sensitive(),
+            'media-next': win.media_next.get_sensitive(), 'media-player': bool(win.authorized and win.media_players),
+            'audio-start': win.enabled('audio') and not active_audio and not win.audio_pending,
+            'audio-stop': win.enabled('audio') and active_audio and not win.audio_pending,
+            'screen-start': win.enabled('screen') and not active_screen,
+            'laptop-display': win.laptop_display_button.get_sensitive(),
+            'firefox-enabled': win.authorized and win.firefox_switch.get_sensitive()}
+        hotspot = win.phone_connectivity_state.get('hotspot_enabled')
+        available['hotspot-on'] = available['hotspot-on'] and hotspot is not True
+        available['hotspot-off'] = available['hotspot-off'] and hotspot is not False
+        for source, prefix in [('phone', 'phone'), ('desktop', 'laptop')]:
+            allowed = win.sound_widgets[source]['mute'].get_sensitive()
+            sound = win.sound_state.get('sound' if source == 'phone' else 'desktop_sound', {})
+            available[prefix + '-muted'] = allowed
+            available[prefix + '-volume-up'] = allowed and sound.get('volume', 0) < 100
+            available[prefix + '-volume-down'] = allowed and sound.get('volume', 0) > 0
+        return available
+
+    def run_quick_action(self, name, value):
+        win = self.main_window()
+        if self.action_availability(win).get(name): self.quick_handlers[name][0](win, value)
+
+    def set_muted(self, win, source, desired):
+        sound = win.sound_state.get('sound' if source == 'phone' else 'desktop_sound', {})
+        if sound.get('muted', False) != desired: win.mute_sound(source)
+
+    def change_volume(self, win, source, amount):
+        sound = win.sound_state.get('sound' if source == 'phone' else 'desktop_sound', {})
+        data = {'source': source, 'volume': max(0, min(100, sound.get('volume', 0) + amount))}
+        if source == 'desktop': data['output'] = sound.get('output', '')
+        win.execute('sound', 'volume', data, quiet=True)
+
+    def disconnect_bluetooth(self, win, address):
+        row = win.phone_device_rows.get(address)
+        if row and row.get_sensitive() and address not in win.bluetooth_commands_pending:
+            win.request_bluetooth_disconnect(address)
+
+    def select_player(self, win, target):
+        for index, player in enumerate(win.media_players):
+            if json.dumps([player.get('origin'), player.get('session', '')]) == target:
+                win.media_picker.set_selected(index)
+                break
+
+    def start_audio(self, win, source):
+        if source in ('desktop', 'phone'):
+            win.request_audio_route(source, True)
+
+    def start_screen_mode(self, win, mode):
+        if mode not in ('phone', 'view', 'control', 'extend', 'primary'): return
+        if mode != 'phone':
+            win.screen_extend_switch.set_active(mode == 'extend')
+            win.screen_control_switch.set_active(mode != 'view')
+            win.screen_blank_switch.set_active(mode == 'primary')
+        win.start_screen('phone' if mode == 'phone' else 'desktop')
+
+    def share_link(self):
+        self.activate()
+        win = self.main_window()
+        target = (win.path, win.generation)
+        entry = Gtk.Entry(placeholder_text='https://example.com', activates_default=True)
+        dialog = Adw.AlertDialog(heading='Send a link to your phone',
+            body='Open a web page on ' + win.devices.get(win.path, {}).get('Name', 'your phone') + '.')
+        dialog.set_extra_child(entry)
+        dialog.add_response('cancel', 'Cancel'); dialog.add_response('send', 'Send Link')
+        dialog.set_response_appearance('send', Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response('send'); dialog.set_close_response('cancel')
+        def valid_link():
+            try:
+                uri = GLib.Uri.parse(entry.get_text().strip(), GLib.UriFlags.NONE)
+                return uri.get_scheme() in ('http', 'https') and bool(uri.get_host())
+            except GLib.Error: return False
+        entry.connect('changed', lambda *_: dialog.set_response_enabled('send', valid_link()))
+        dialog.set_response_enabled('send', False)
+        def response(dialog, response):
+            if response != 'send' or not valid_link(): return
+            if target != (win.path, win.generation) or not win.enabled('urls'):
+                win.error('The selected phone changed or disconnected. Open Send Link again.')
+                return
+            win.execute('urls', 'open', {'url': entry.get_text().strip()})
+        dialog.connect('response', response)
+        dialog.present(win)
+
+    def set_feature(self, feature, enabled):
+        win = self.main_window()
+        if not win or not win.authorized or not win.path: return
+        cap = win.capabilities.get(feature, {})
+        token = (win.path, win.generation, feature)
+        if cap.get('status') not in ('available', 'disabled', 'user_action_required') or token in self.feature_pending: return
+        if (cap['status'] != 'disabled') == enabled: return
+        self.feature_pending.add(token)
+        path = win.path
+        def finished(message=None):
+            self.feature_pending.discard(token)
+            if message and (win.path, win.generation) == token[:2]: win.error(message)
+            win.changed(path); self.update_desktop()
+        win.client.call(path, 'org.unityconnect.Device1', 'SetFeatureEnabled', '(sb)', (feature, enabled),
+                        lambda _: finished(), failed=finished)
+        self.update_desktop()
+
+    def update_desktop(self):
+        # Coalesce all widget/state renders into one menu update after the full
+        # device snapshot has been applied, including during window construction.
+        if self.desktop_source is None:
+            self.desktop_source = GLib.idle_add(self.sync_desktop)
+
+    def sync_desktop(self):
+        self.desktop_source = None
+        win = self.main_window()
+        valid = win is not None and hasattr(win, 'client')
+        path = win.path if valid else ''
+        availability = self.action_availability(win)
+        availability.update({
+            'find-phone': valid and win.enabled('find'),
+            'stop-screen': valid and win.enabled('screen') and win.screen_state.get('state') in ('starting', 'streaming'),
+            'refresh': valid and win.authorized, 'discover': valid and win.authorized,
+            'device': valid and bool(win.devices),
+            'audio-transport': valid and win.audio_transport.get_sensitive()})
+        for name, enabled in availability.items(): self.lookup_action(name).set_enabled(bool(enabled))
+        for page in self.PAGE_TITLES:
+            self.lookup_action('page-' + page).set_enabled(bool(valid and win.pages[page].get_visible()))
+        self.lookup_action('device').set_state(GLib.Variant('s', path or ''))
+        for name, key in [('keep-running', 'keep_running'), ('show-status', 'show_status'),
+                          ('appearance', 'appearance'), ('audio-transport', 'audio_transport')]:
+            value = self.preferences[key]
+            self.lookup_action(name).set_state(GLib.Variant('b' if type(value) is bool else 's', value))
+        if valid:
+            win.desktop_preferences_updating = True
+            win.background_switch.set_active(self.preferences['keep_running'])
+            win.indicator_status_switch.set_active(self.preferences['show_status'])
+            win.appearance_combo.set_selected(['system', 'light', 'dark'].index(self.preferences['appearance']))
+            win.audio_transport.set_selected(['auto', 'lan', 'bluetooth'].index(self.preferences['audio_transport']))
+            win.desktop_preferences_updating = False
+        self.lookup_action('ringer-mode').set_state(GLib.Variant('s', win.ringer_state.get('mode', '') if valid else ''))
+        self.lookup_action('firefox-enabled').set_state(GLib.Variant('b', bool(valid and win.firefox_status.get('enabled'))))
+        player = win.media_state if valid else {}
+        self.lookup_action('media-player').set_state(GLib.Variant('s', json.dumps([player.get('origin'), player.get('session', '')])))
+        for source, prefix in [('phone', 'phone'), ('desktop', 'laptop')]:
+            sound = win.sound_state.get('sound' if source == 'phone' else 'desktop_sound', {}) if valid else {}
+            self.lookup_action(prefix + '-muted').set_state(GLib.Variant('b', bool(sound.get('muted'))))
+        for feature, cap in (win.capabilities.items() if valid else []):
+            if feature not in self.feature_actions and cap.get('status') in ('available', 'disabled', 'user_action_required'):
+                # Feature IDs are protocol identifiers. Encode them to keep
+                # GAction names valid and distinct, including underscores.
+                name = 'feature-' + feature.encode().hex()
+                self.feature_actions[feature] = name
+                self.add_action_handler(name, lambda enabled, f=feature: self.set_feature(f, enabled), state=False)
+        for feature, name in self.feature_actions.items():
+            cap = win.capabilities.get(feature, {}) if valid else {}
+            action = self.lookup_action(name)
+            action.set_state(GLib.Variant('b', cap.get('status') in ('available', 'user_action_required')))
+            action.set_enabled(bool(valid and win.authorized and path and cap.get('status') in
+                ('available', 'disabled', 'user_action_required') and (path, win.generation, feature) not in self.feature_pending))
+        groups, sharing = self.desktop_menu_groups(win if valid else None)
+        for key, entries in groups.items():
+            signature = repr(self.native_menu_shape(entries))
+            if self.menu_signatures.get(key) != signature:
+                self.menu_signatures[key] = signature
+                self.fill_native_menu(self.menu_models[key], entries)
+        if not self.indicator: return False
+        props = win.devices.get(path, {}) if valid else {}
+        connected = bool(valid and win.authorized and props.get('Connected'))
+        status = (win.connection_value.get_label() if connected else
+                  'Access required' if valid and not win.authorized else 'Disconnected').removesuffix(' connected')
+        battery = win.battery_value.get_label() if connected else 'Unavailable'
+        if battery != 'Unavailable': status += ' · ' + battery
+        phone_name = props.get('Name', 'No paired phone')
+        item, separator = self.menu_item, self.menu_separator
+        items = [item('phone-name', phone_name), item('status', status)] if self.preferences['show_status'] else []
+        items.extend([item('show', 'Open Unity', 'show'),
+                      item(str(path) + ':find-phone', 'Stop Ringing' if valid and win.find_state.get('state') == 'ringing' else 'Find Phone', 'find-phone'),
+                      item(str(path) + ':send-files', 'Send Files…', 'send-files'), separator('indicator-actions')])
+        for key, title, entries in [('file', 'Share', sharing), ('phone', 'Phone', groups['phone']),
+                ('media', 'Media and Audio', groups['media']), ('screen', 'Screen Sharing', groups['screen']),
+                ('view', 'Open Page', groups['view']), ('settings', 'Settings', groups['settings'])]:
+            items.append(item(str(path) + ':group-' + key, title, children=entries))
+        items.extend([separator('indicator-quit'), item('quit', 'Quit Unity', 'quit')])
+        self.indicator.update(items, phone_name + ' · ' + status)
+        return False
+
+    def menu_item(self, key, title, action=None, target=None, children=None):
+        props = {'label': title, 'enabled': False}
+        if children is not None:
+            props['enabled'] = any(child['props'].get('enabled') for child in children)
+        elif action:
+            command = self.lookup_action(action)
+            props['enabled'] = command.get_enabled()
+            state = command.get_state()
+            if state is not None and state.get_type_string() == 'b':
+                props.update({'toggle-type': 'checkmark', 'toggle-state': int(state.unpack())})
+            elif state is not None and target is not None:
+                props.update({'toggle-type': 'radio', 'toggle-state': int(state.unpack() == target)})
+        node = dict(key=key, props=props, action=action, target=target)
+        if children is not None: node['children'] = children
+        return node
+
+    @staticmethod
+    def menu_separator(key):
+        return dict(key=key, props={'type': 'separator'})
+
+    def desktop_menu_groups(self, win):
+        path = (win.path or '') if win else ''
+        def item(title, action=None, target=None, children=None, key=None):
+            return self.menu_item(key or path + ':' + (action or title) + ':' + str(target or ''), title, action, target, children)
+        def separator(key): return self.menu_separator(path + ':' + key)
+        find = 'Stop Ringing' if win and win.find_state.get('state') == 'ringing' else 'Find Phone'
+        view = [item(title, 'page-' + page) for page, title in self.PAGE_TITLES.items()]
+        sharing = [item('Send Files…', 'send-files'), item('Send a Link…', 'share-link'), item('New Message…', 'new-message'),
+            item('Browse Phone Files', 'browse-files'), item('Open Last Received File', 'open-received-file'),
+            item('Photos and Videos', 'page-photos'), item('Notifications', 'page-notifications'), item('Calls', 'page-calls')]
+        files = [item('Open Unity', 'show'), *sharing, separator('file-end'),
+                 item('Pair a Phone…', 'discover'), item('Refresh', 'refresh'), item('Quit Unity', 'quit')]
+        phones = [item(find, 'find-phone'), item('Lock Phone', 'lock-phone'), separator('phone-controls')]
+        ringer = [item(title, 'ringer-mode', mode) for mode, title in [('normal', 'Ring'), ('vibrate', 'Vibrate'),
+                  ('silent', 'Silent'), ('dnd', 'Do Not Disturb'), ('off', 'Turn Off Do Not Disturb')]]
+        phones.append(item('Phone Sound', children=ringer))
+        hotspot = win.phone_connectivity_state.get('hotspot_enabled') if win else None
+        phones.append(item('Mobile Hotspot', children=[
+            item('On' if hotspot is True else 'Off' if hotspot is False else 'State unavailable'),
+            item('Turn On Hotspot', 'hotspot-on'), item('Turn Off Hotspot', 'hotspot-off')]))
+        bluetooth = []
+        if win:
+            for device in win.phone_connectivity_state.get('devices', []):
+                address = device.get('address', '')
+                if address not in win.phone_device_rows: continue
+                pending = address in win.bluetooth_commands_pending
+                bluetooth.append(item(device.get('name') or address, None if pending else 'disconnect-bluetooth',
+                    None if pending else address, key=path + ':bluetooth:' + address))
+        if bluetooth: phones.append(item('Disconnect Bluetooth Device', children=bluetooth))
+        phones.append(item('Refresh Phone Connections', 'refresh-connections'))
+        devices = [item(props.get('Name', 'Phone') + (' · Connected' if props.get('Connected') else ' · Disconnected'),
+                   'device', device) for device, props in (win.devices.items() if win else [])]
+        if devices: phones.extend([separator('phone-select'), item('Selected Phone', children=devices)])
+        phones.append(item('Pair a Phone…', 'discover'))
+        phones.append(item('Refresh Unity', 'refresh'))
+        players = [item(('Laptop' if p.get('origin') == 'desktop' else 'Phone') + ' · ' +
+                   (p.get('app_name') or p.get('package') or 'Player'), 'media-player',
+                   json.dumps([p.get('origin'), p.get('session', '')])) for p in (win.media_players if win else [])]
+        media = [item((win.media_state.get('title') or 'Nothing playing')[:48] if win else 'Nothing playing')]
+        if players: media.append(item('Choose Player', children=players))
+        media.extend([item('Pause' if win and win.media_state.get('playing') else 'Play', 'media-play-pause'),
+                      item('Previous Track', 'media-previous'), item('Next Track', 'media-next'), separator('media-volume')])
+        for source, prefix, title in [('phone', 'phone', 'Phone Volume'), ('desktop', 'laptop', 'Laptop Volume')]:
+            sound = win.sound_state.get('sound' if source == 'phone' else 'desktop_sound', {}) if win else {}
+            media.append(item(title, children=[item(str(sound['volume']) + '%' if sound.get('available') and 'volume' in sound else 'Unavailable'),
+                item('Mute', prefix + '-muted'), item('Volume Up (10%)', prefix + '-volume-up'),
+                item('Volume Down (10%)', prefix + '-volume-down')]))
+        transport = [item(title, 'audio-transport', value) for value, title in
+                     [('auto', 'Automatic'), ('lan', 'Wi-Fi / LAN'), ('bluetooth', 'Bluetooth')]]
+        media.append(item('Audio Streaming', children=[item('Play Laptop Audio on Phone', 'audio-start', 'desktop'),
+            item('Play Phone Audio on Laptop', 'audio-start', 'phone'), item('Stop Audio Streaming', 'audio-stop'),
+            separator('audio-connection'), item('Audio Connection', children=transport)]))
+        screen = [item(title, 'screen-start', mode) for title, mode in [
+            ('View Phone Screen', 'phone'), ('Share Computer Screen (View Only)', 'view'),
+            ('Share and Control Computer', 'control'), ('Use Phone as Extra Display', 'extend'), ('Use Phone as Main Display', 'primary')]]
+        screen.extend([item('Stop Screen Sharing', 'stop-screen'),
+            item('Turn Laptop Display ' + ('Off' if not win or win.screen_state.get('display_on', True) else 'On'), 'laptop-display'),
+            separator('screen-settings'), item('Screen and Input Settings', 'page-remote')])
+        features = []
+        for feature, cap in sorted(win.capabilities.items() if win else [], key=lambda pair: self.FEATURE_TITLES.get(pair[0], pair[0])):
+            if cap.get('status') in ('available', 'disabled', 'user_action_required'):
+                features.append(item(self.FEATURE_TITLES.get(feature, feature.replace('_', ' ').title()), self.feature_actions[feature]))
+        settings = [item('Open Settings', 'page-settings')]
+        if features: settings.append(item('Phone Features', children=features))
+        settings.extend([item('Appearance', children=[item(title, 'appearance', value) for value, title in
+                         [('system', 'Follow System'), ('light', 'Light'), ('dark', 'Dark')]]),
+            item('Keep Running When Window Closes', 'keep-running'), item('Show Phone Status in Indicator', 'show-status'),
+            item('Firefox Companion', 'firefox-enabled'), separator('settings-pages'),
+            item('Connectivity Settings', 'page-connectivity'), item('Audio and Volume Settings', 'page-media'), item('About Unity', 'about')])
+        return dict(file=files, phone=phones, media=media, screen=screen, view=view, settings=settings,
+                    help=[item('About Unity', 'about')]), sharing
+
+    def fill_native_menu(self, menu, entries):
+        menu.remove_all()
+        section = Gio.Menu()
+        for node in entries:
+            if node['props'].get('type') == 'separator':
+                if section.get_n_items(): menu.append_section(None, section)
+                section = Gio.Menu()
+                continue
+            if 'children' in node:
+                child = Gio.Menu(); self.fill_native_menu(child, node['children'])
+                section.append_submenu(node['props']['label'], child)
+            else:
+                entry = Gio.MenuItem.new(node['props']['label'], 'app.' + node['action'] if node['action'] else None)
+                if node['target'] is not None:
+                    entry.set_action_and_target_value('app.' + node['action'], GLib.Variant('s', node['target']))
+                section.append_item(entry)
+        if section.get_n_items(): menu.append_section(None, section)
+
+    @classmethod
+    def native_menu_shape(cls, entries):
+        # Enabled and checked states are already exported by GAction; changing
+        # them must not rebuild an open native menu.
+        return [(node['props'].get('label'), node['props'].get('type'), node.get('action'), node.get('target'),
+                 cls.native_menu_shape(node.get('children', []))) for node in entries]
+
+    def do_shutdown(self):
+        if self.desktop_source is not None:
+            GLib.source_remove(self.desktop_source)
+            self.desktop_source = None
+        if self.indicator:
+            self.indicator.close()
+        Adw.Application.do_shutdown(self)
 
     def do_command_line(self, command_line):
         for option_name, page in [('open-messages', 'messages'), ('open-notifications', 'notifications')]:

@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Session Continuity",
+  "version": "1.1.0",
+  "description": "Keep your last page, media position, reading place, and explicitly approved form values on this device.",
+  "browser_specific_settings": {
+    "gecko_android": { "strict_min_version": "153.0" },
+    "gecko": {
+      "id": "session-continuity@local.invalid",
+      "strict_min_version": "153.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  },
+  "permissions": ["storage", "tabs", "sessions", "webNavigation", "cookies", "contextualIdentities", "scripting", "alarms", "nativeMessaging"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "incognito": "not_allowed",
+  "background": { "scripts": ["src/background/main.js"], "type": "module" },
+  "content_scripts": [{
+    "matches": ["http://*/*", "https://*/*"],
+    "js": ["content.bundle.js"],
+    "run_at": "document_start",
+    "all_frames": false
+  }],
+  "action": { "default_title": "Session Continuity", "default_popup": "ui/popup.html", "default_icon": "icons/continuity.svg" },
+  "icons": { "48": "icons/continuity.svg", "96": "icons/continuity.svg" },
+  "options_ui": { "page": "ui/options.html", "open_in_tab": true },
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'none'" }
+}

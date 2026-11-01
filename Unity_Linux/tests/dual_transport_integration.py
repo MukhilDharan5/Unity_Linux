@@ -54,6 +54,15 @@ class DualTransportIntegration(unittest.TestCase):
         bt = Peer(self.port, info['fingerprint'], secret, self.bluez.open())
         wait_for(lambda: self.status()['transport']['kind'] == 'both')
         self.assertEqual(self.status()['battery']['level'], 82)
+        # Reject one broken feature payload without losing either authenticated
+        # link, its pending transfer or subsequent valid updates.
+        bt.event('notifications', {'id': 'bad', 'app': 'chat', 'title': '\0', 'text': '', 'removed': False})
+        bt.event('battery', {'level': 83, 'charging': False})
+        wait_for(lambda: self.status()['battery']['level'] == 83)
+        self.assertEqual(self.status()['transport']['kind'], 'both')
+        self.assertNotIn('bad', self.status().get('notifications', {}))
+        bt.event('battery', {'level': 82, 'charging': False})
+        wait_for(lambda: self.status()['battery']['level'] == 82)
         self.assertEqual(self.status()['transport'], {'kind': 'both', 'links': ['bluetooth', 'lan'], 'control': 'bluetooth', 'bulk': 'lan'})
         for i in range(0, len(data), 49152): lan.event('files', {'phase': 'chunk', 'id': transfer, 'data': base64.b64encode(data[i:i+49152]).decode()})
         lan.event('files', {'phase': 'end', 'id': transfer})

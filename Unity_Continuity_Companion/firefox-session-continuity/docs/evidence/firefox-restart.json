@@ -1,0 +1,41 @@
+{
+  "unsignedOnlyInIsolatedNightlyProfile": true,
+  "results": [
+    {
+      "name": "native-session-on",
+      "status": "passed",
+      "version": "160.0a1",
+      "buildID": "20261022084508",
+      "savedRevision": 8,
+      "newProcessVerified": true,
+      "activeURL": "http://127.0.0.1:50391/fixture?route=restart-b#reading",
+      "targetCount": 1,
+      "mediaSeconds": 755,
+      "scrollProgress": 0.75
+    },
+    {
+      "name": "native-session-off",
+      "status": "passed",
+      "version": "160.0a1",
+      "buildID": "20261022084508",
+      "savedRevision": 8,
+      "newProcessVerified": true,
+      "activeURL": "http://127.0.0.1:50391/fixture?route=restart-b#reading",
+      "targetCount": 1,
+      "mediaSeconds": 755,
+      "scrollProgress": 0.75
+    },
+    {
+      "name": "unexpected-termination",
+      "status": "passed",
+      "version": "160.0a1",
+      "buildID": "20261022084508",
+      "savedRevision": 8,
+      "newProcessVerified": true,
+      "activeURL": "http://127.0.0.1:50391/fixture?route=restart-b#reading",
+      "targetCount": 1,
+      "mediaSeconds": 755,
+      "scrollProgress": 0.75
+    }
+  ]
+}

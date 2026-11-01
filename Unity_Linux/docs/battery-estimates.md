@@ -1,6 +1,6 @@
 # Phone battery power and time estimates
 
-Install companion 0.1.6 or later and update the Linux daemon and GTK client. Open Overview in Unity to see battery percentage, battery draw in watts and estimated time left. While charging, the card shows net charging watts and estimated time to full. Full and paused charging have separate states. No additional Android permission or root access is needed.
+Install companion 0.1.6 or later and update the Linux daemon and GTK client. Overview shows two compact cards in one horizontal row: LAN, Bluetooth or LAN + Bluetooth connection status, and battery percentage with power draw in watts. The cards size to their text. While charging, the power reading shows net charging watts. Time estimates are available through the daemon API. No additional Android permission or root access is needed.
 
 The companion reads Android BatteryManager current and remaining charge properties, together with battery voltage from ACTION_BATTERY_CHANGED. It publishes on battery broadcasts and every 30 seconds while connected and the battery feature is enabled. Sampling stops on disconnect or feature disable. Linux validates the optional readings and exposes them through the existing battery snapshot, Device1 state and `unityctl battery DEVICE`.
 

@@ -18,16 +18,19 @@ impl Plugin for Feature {
         let fields = data.as_object().unwrap();
         if action == "start" {
             if !matches!(data["source"].as_str(), Some("phone" | "desktop"))
-                || fields
-                    .keys()
-                    .any(|k| !["source", "control", "blank_display"].contains(&k.as_str()))
+                || fields.keys().any(|k| {
+                    !["source", "control", "blank_display", "extend_display"].contains(&k.as_str())
+                })
             {
                 bail!("screen source must be phone or desktop")
             }
-            for key in ["control", "blank_display"] {
+            for key in ["control", "blank_display", "extend_display"] {
                 if fields.contains_key(key) && !data[key].is_boolean() {
                     bail!("invalid screen option")
                 }
+            }
+            if data["blank_display"] == true && data["extend_display"] == true {
+                bail!("Choose primary or extended display, not both")
             }
             if data["source"] == "phone" && fields.len() != 1
                 || data["blank_display"] == true && data["control"] == false
@@ -165,6 +168,26 @@ impl Plugin for Feature {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn extended_display_is_optional_input_and_exclusive_with_primary_handoff() {
+        let feature = Feature;
+        for control in [false, true] {
+            assert!(feature
+                .command(
+                    "start",
+                    &json!({"source":"desktop","control":control,"extend_display":true})
+                )
+                .is_ok());
+        }
+        for invalid in [
+            json!({"source":"desktop","blank_display":true,"extend_display":true}),
+            json!({"source":"desktop","extend_display":"true"}),
+            json!({"source":"phone","extend_display":true}),
+        ] {
+            assert!(feature.command("start", &invalid).is_err());
+        }
+    }
 
     #[test]
     fn screen_controls_validate_scope_and_bounded_input() {

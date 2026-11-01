@@ -7,15 +7,18 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /** A framed peer for exercising the production coordinator, queues and dispatch. TLS has its own tests. */
-internal class TestConnection(private val service: CompanionService, both: Boolean = false) : Closeable {
+internal class TestConnection(private val service: CompanionService, both: Boolean = false, savedHost: String = "test.invalid") : Closeable {
  val lan = Peer()
  val bluetooth = Peer()
  val attempts = java.util.concurrent.atomic.AtomicInteger()
+ val lanAttempts = java.util.concurrent.atomic.AtomicInteger()
+ val lanDestinations = java.util.concurrent.CopyOnWriteArrayList<LanAddress>()
  @Volatile var rejectBluetooth = false
+ @Volatile var rejectLan = false
  private val connection: Connection
  init {
   service.connection.stop()
-  service.getSharedPreferences("settings", 0).edit().putString("host", "test.invalid")
+  service.getSharedPreferences("settings", 0).edit().putString("host", savedHost)
    .putString("fingerprint", "ab".repeat(32)).putString("transport", if (both) "both" else "lan")
    .putString("bluetooth_address", "AA:BB:CC:DD:EE:FF").commit()
   connection = Connection(service, { "cd".repeat(32) }, {}, { endpoint, opening ->
@@ -23,12 +26,17 @@ internal class TestConnection(private val service: CompanionService, both: Boole
     attempts.incrementAndGet()
     check(!rejectBluetooth) { "Bluetooth unavailable" }
     bluetooth
-   } else lan
+   } else {
+    lanAttempts.incrementAndGet()
+    lanDestinations.add(LanAddress(endpoint.host,endpoint.port))
+    check(!rejectLan) { "LAN unavailable" }
+    lan
+   }
    peer.channel().also { opening(it) }
   })
   service.connection = connection
   connection.start()
-  await { connection.ready && connection.desktopAvailable("lock") && (!both || connection.transportLabel == "Bluetooth + Wi-Fi / LAN") }
+  await { connection.ready && connection.desktopAvailable("lock") && (!both || savedHost.isBlank() || connection.transportLabel == "Bluetooth + Wi-Fi / LAN") }
  }
  override fun close() = connection.stop()
  fun await(test: () -> Boolean) {

@@ -38,6 +38,8 @@ class ScreenAndLockTest {
   assertEquals(.5f to .5f, screenPoint(400,800,1280,720,200f,400f))
   assertNull(screenPoint(400,800,1280,720,200f,10f))
   assertEquals(0f to 0f, screenPoint(400,800,1280,720,-1f,-1f,true))
+  assertEquals(.5f to .5f, screenPoint(800,400,1280,720,400f,200f))
+  assertNull(screenPoint(800,400,1280,720,10f,200f))
   assertNull(screenPoint(0,800,1280,720,0f,10f))
   assertNull(screenPoint(400,800,1280,720,Float.NaN,10f))
  }
@@ -79,6 +81,33 @@ class ScreenAndLockTest {
   val data = request().put("source","desktop").put("control",true).put("blank_display",true)
   val parsed = ScreenRequest.parse(data); assertTrue(parsed.control); assertTrue(parsed.blankDisplay)
   assertFalse(ScreenRequest.parse(request()).control)
+ }
+ @Test fun extendedDisplayIsSeparateFromPrimaryAndDoesNotRequirePhoneInput() {
+  val data=request().put("source","desktop").put("extend_display",true).put("control",false)
+  val parsed=ScreenRequest.parse(data)
+  assertTrue(parsed.extendDisplay); assertFalse(parsed.blankDisplay); assertFalse(parsed.control)
+  assertThrows(IllegalArgumentException::class.java) { ScreenRequest.parse(data.put("blank_display",true)) }
+  assertThrows(IllegalArgumentException::class.java) { ScreenRequest.parse(request().put("source","desktop").put("extend_display","true")) }
+  assertThrows(IllegalArgumentException::class.java) { ScreenRequest.parse(request().put("extend_display",true)) }
+ }
+ @Test fun phoneExtendedDisplayActionRequestsASeparateMonitor() {
+  val controller=Robolectric.buildService(CompanionService::class.java).create(); val service=controller.get()
+  service.getSharedPreferences("settings",0).edit().putBoolean("enable.screen",true).commit()
+  try { TestConnection(service).use { fixture ->
+   fixture.lan.send(JSONObject().put("type","capabilities").put("capabilities",org.json.JSONArray()
+    .put(JSONObject().put("id","screen").put("status","available"))))
+   fixture.await { service.connection.desktopAvailable("screen") }
+   val activity=Robolectric.buildActivity(MainActivity::class.java).setup()
+   try {
+    val button=activity.get().findViewById<android.view.View>(R.id.view_computer_extended_display)
+    assertTrue(button.isEnabled); button.performClick()
+    val command=fixture.lan.next { it.optString("type")=="request" && it.optString("feature")=="screen" }
+    assertEquals("start",command.getString("action"))
+    val data=command.getJSONObject("data")
+    assertEquals("desktop",data.getString("source")); assertTrue(data.getBoolean("extend_display"))
+    assertFalse(data.optBoolean("blank_display"))
+   } finally { activity.pause().stop().destroy() }
+  } } finally { controller.destroy(); shadowOf(Looper.getMainLooper()).idle() }
  }
  @Test fun largeImagesAreRejectedBeforeDecodeAndJpegPixelsArePlayable() {
   fun jpeg(w: Int,h: Int): ByteArray {
@@ -159,6 +188,29 @@ class ScreenAndLockTest {
    val rendered = Bitmap.createBitmap(1080,1920,Bitmap.Config.ARGB_8888); content.draw(android.graphics.Canvas(rendered))
    val output = java.io.File("build/reports/unity-preview/screen-control-test.png"); output.parentFile!!.mkdirs()
    output.outputStream().use { assertTrue(rendered.compress(Bitmap.CompressFormat.PNG,100,it)) }; rendered.recycle()
+   assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR,activity.requestedOrientation)
+   val rotate = activity.findViewById<android.widget.ImageButton>(R.id.screen_orientation_toggle)
+   rotate.performClick()
+   assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE,activity.requestedOrientation)
+   val landscape = android.content.res.Configuration(activity.resources.configuration).apply {
+    orientation = android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    screenWidthDp = 800; screenHeightDp = 400
+   }
+   viewer.configurationChange(landscape)
+   assertSame(activity,viewer.get()); assertTrue(screen.active()); assertSame(bitmap,screen.bitmap)
+   assertEquals("Use portrait",rotate.contentDescription)
+   content.measure(android.view.View.MeasureSpec.makeMeasureSpec(1920,android.view.View.MeasureSpec.EXACTLY),android.view.View.MeasureSpec.makeMeasureSpec(1080,android.view.View.MeasureSpec.EXACTLY)); content.layout(0,0,1920,1080)
+   val landscapeView = activity.findViewById<RemoteScreenView>(R.id.computer_screen_view)
+   assertTrue(landscapeView.width > landscapeView.height)
+   val landscapeBitmap = Bitmap.createBitmap(1920,1080,Bitmap.Config.ARGB_8888); content.draw(android.graphics.Canvas(landscapeBitmap))
+   java.io.File("build/reports/unity-preview/screen-control-landscape-test.png").outputStream().use {
+    assertTrue(landscapeBitmap.compress(Bitmap.CompressFormat.PNG,100,it))
+   }; landscapeBitmap.recycle()
+   rotate.performClick()
+   assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT,activity.requestedOrientation)
+   rotate.performLongClick()
+   assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR,activity.requestedOrientation)
+   assertTrue(screen.active())
    service.connection.ready = false
    service.features.screen.stop("Disconnected test"); shadowOf(Looper.getMainLooper()).idle()
    assertFalse(keyboard.isEnabled)

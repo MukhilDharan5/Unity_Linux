@@ -25,22 +25,28 @@ APP_ID = 'org.unityconnect.Unity.Screen'
 
 
 def output_config():
-    process = subprocess.run(['kscreen-doctor', '--json'], capture_output=True, text=True, timeout=3, check=True)
-    return json.loads(process.stdout)['outputs']
+    process = subprocess.run(['/usr/bin/python3', str(Path(__file__).with_name('display-guard.py')), '--list-outputs'],
+        capture_output=True, text=True, timeout=4)
+    if process.returncode:
+        reason = process.stderr.strip().splitlines()
+        raise RuntimeError(reason[-1][:300] if reason else "Cannot read the desktop monitor configuration")
+    return json.loads(process.stdout)
+
 
 
 class GuardClient:
-    def __init__(self, directory, virtual_output=None):
+    def __init__(self, directory, virtual_output=None, extended_display=False):
         self.lock = threading.RLock()
         arguments = ['/usr/bin/python3', str(Path(__file__).with_name('display-guard.py')), '--state-dir', str(directory)]
         if virtual_output: arguments += ['--virtual-output', virtual_output]
+        if extended_display: arguments.append('--extended-display')
         self.process = subprocess.Popen(arguments,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         try: self.state = self.read()
         except Exception:
             self.close()
             raise
-        if not self.state.get('display_available'):
+        if not (self.state.get('extended_display') if extended_display else self.state.get('display_available')):
             self.close()
             raise RuntimeError(self.state.get('error', 'Laptop display control is unavailable'))
 
@@ -55,7 +61,7 @@ class GuardClient:
     def send(self, action):
         with self.lock:
             if self.process.poll() is not None:
-                raise RuntimeError('Laptop display guard stopped; its recovery journal will restore brightness')
+                raise RuntimeError('Laptop display guard stopped; its recovery journal will restore the laptop display')
             self.process.stdin.write(json.dumps({'action': action}) + '\n'); self.process.stdin.flush()
             if action != 'heartbeat':
                 self.state = self.read()
@@ -78,7 +84,7 @@ def dimensions(width, height):
 
 
 class Capture:
-    def __init__(self, control=False, state_dir=None):
+    def __init__(self, control=False, state_dir=None, phone_display=False, extended_display=False):
         Gst.init(None)
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         self.registered = False
@@ -95,6 +101,14 @@ class Capture:
         self.error = None
         self.stop = threading.Event()
         self.control = control
+        if phone_display and extended_display: raise ValueError('Choose primary or extended display, not both')
+        self.phone_display = phone_display
+        self.extended_display = extended_display
+        self.guard_requested = False
+        self.display_attempts = 0
+        self.virtual = False
+        self.before_outputs = set()
+        self.virtual_size = None
         self.state_dir = state_dir
         self.guard = None
         self.ready = False
@@ -177,7 +191,17 @@ class Capture:
         source_types = int(props.get('AvailableSourceTypes', 1)) & (1 if self.control else 3)
         virtual = False
         before_outputs = set()
-        if self.control and self.registered and int(props.get('AvailableSourceTypes', 1)) & 4:
+        if self.phone_display or self.extended_display:
+            if (self.phone_display and not self.control) or not self.state_dir or not int(props.get('AvailableSourceTypes', 1)) & 4:
+                raise RuntimeError('This desktop cannot use the phone as a virtual primary display' if self.phone_display else 'This desktop cannot create a virtual extended display')
+            baseline = output_config()
+            before_outputs = {o['name'] for o in baseline}
+            panel = next((o for o in baseline if o.get('type') == 7 and o.get('enabled')), None)
+            if panel is None: raise RuntimeError('An active built-in laptop display is required')
+            mode = next((m for m in panel['modes'] if m['id'] == panel['currentModeId']), None)
+            if mode: self.virtual_size = (mode['size']['width'], mode['size']['height'])
+            source_types = 4; virtual = True
+        elif self.control and self.registered and int(props.get('AvailableSourceTypes', 1)) & 4:
             try:
                 permission = self.bus.call_sync('org.freedesktop.impl.portal.PermissionStore', '/org/freedesktop/impl/portal/PermissionStore',
                     'org.freedesktop.impl.portal.PermissionStore', 'GetPermission',
@@ -187,6 +211,7 @@ class Capture:
                     source_types = 4
                     virtual = True
             except (GLib.Error, OSError, ValueError, subprocess.SubprocessError): pass
+        self.virtual = virtual; self.before_outputs = before_outputs
         if not source_types:
             raise RuntimeError('This desktop portal cannot share monitors or windows')
         cursor_modes = int(props.get('AvailableCursorModes', 1))
@@ -210,6 +235,9 @@ class Capture:
             raise RuntimeError('Choose one screen or window')
         node, stream_props = streams[0]
         size = stream_props.get('size')
+        if size and (size[0] <= 0 or size[1] <= 0): size = None
+        if virtual and stream_props.get('source_type', 4) != 4:
+            raise RuntimeError('The desktop did not create the requested phone display')
         self.node = int(node)
         self.logical_size = stream_props.get('logical_size', size)
         try:
@@ -217,17 +245,6 @@ class Capture:
                 GLib.Variant('(sua{sv})', ('', 12, {'reason': GLib.Variant('s', 'Unity screen sharing')})),
                 GLib.VariantType.new('(o)'), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
         except GLib.Error: pass
-        display_error = ''
-        if self.control and self.state_dir:
-            try:
-                virtual_output = None
-                if virtual:
-                    created_outputs = [o['name'] for o in output_config() if o['name'] not in before_outputs]
-                    if len(created_outputs) != 1: raise RuntimeError('Cannot identify the Unity virtual display')
-                    virtual_output = created_outputs[0]
-                self.guard = GuardClient(self.state_dir, virtual_output)
-                if self.guard.state.get('logical_size'): self.logical_size = self.guard.state['logical_size']
-            except Exception as error: display_error = str(error)
         # PipeWire may omit size. Negotiate it on the source pad before scaling.
         reply, fd_list = self.bus.call_with_unix_fd_list_sync(PORTAL, PATH, SCREEN,
             'OpenPipeWireRemote', GLib.Variant('(oa{sv})', (self.session, {})),
@@ -236,7 +253,8 @@ class Capture:
         try:
             self.pipeline = Gst.parse_launch(
                 f'pipewiresrc name=source fd={fd} path={int(node)} do-timestamp=true ! '
-                'queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! '
+                + (f'video/x-raw,width={self.virtual_size[0]},height={self.virtual_size[1]} ! ' if self.virtual_size else '')
+                + 'queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! '
                 'videorate drop-only=true ! video/x-raw,framerate=15/1 ! videoconvert ! videoscale name=scale add-borders=false ! '
                 'capsfilter name=limits caps="video/x-raw,framerate=15/1,pixel-aspect-ratio=1/1" ! '
                 'jpegenc name=encoder quality=70 ! appsink name=frames max-buffers=1 drop=true sync=false')
@@ -286,6 +304,9 @@ class Capture:
                             encoder = self.pipeline.get_by_name('encoder')
                             encoder.set_property('quality', max(10, encoder.get_property('quality') - 15))
                             continue
+                        if self.virtual and not self.guard_requested:
+                            self.guard_requested = True
+                            GLib.idle_add(self.prepare_display)
                         data = struct.pack('>I', length) + buffer.extract_dup(0, length)
                         view = memoryview(data)
                         while view and not self.stop.is_set():
@@ -298,7 +319,7 @@ class Capture:
             self.pipeline.set_state(Gst.State.PLAYING)
             self.ready = True
             self.report({'type': 'state', 'input_enabled': self.control, 'display_available': self.guard is not None,
-                'display_on': True, 'display_error': display_error})
+                'display_on': True, 'phone_primary': False, 'display_error': ''})
             worker.start()
             self.loop.run()
             self.bus.signal_unsubscribe(subscription)
@@ -308,6 +329,30 @@ class Capture:
             if self.pipeline:
                 self.pipeline.set_state(Gst.State.NULL)
             os.close(fd)
+
+    def prepare_display(self):
+        # Mutter creates the virtual output only after PipeWire negotiates video.
+        # Do not claim a display or switch the panel off before the first frame.
+        if self.cancelled or self.stop.is_set(): return GLib.SOURCE_REMOVE
+        try:
+            created = [o for o in output_config() if o['name'] not in self.before_outputs and o.get('enabled')]
+            if not created and self.display_attempts < 30:
+                self.display_attempts += 1
+                GLib.timeout_add(100, self.prepare_display)
+                return GLib.SOURCE_REMOVE
+            if len(created) != 1: raise RuntimeError('Cannot identify the active Unity phone display')
+            self.guard = (GuardClient(self.state_dir, created[0]['name'], extended_display=True)
+                if self.extended_display else GuardClient(self.state_dir, created[0]['name']))
+            if self.guard.state.get('logical_size'): self.logical_size = self.guard.state['logical_size']
+            self.report({'type': 'state', 'input_enabled': self.control,
+                'display_available': not self.extended_display, 'extended_display': self.extended_display,
+                'display_on': True, 'phone_primary': False, 'display_error': ''})
+        except Exception as error:
+            self.error = 'Phone display setup failed: ' + str(error)
+            self.report({'type': 'state', 'input_enabled': self.control,
+                'display_available': False, 'display_on': True, 'display_error': self.error[:512]})
+            self.cancel()
+        return GLib.SOURCE_REMOVE
 
     def report(self, value):
         print(json.dumps(value, ensure_ascii=True), file=sys.stderr, flush=True)
@@ -338,7 +383,8 @@ class Capture:
             if action == 'display':
                 if not self.guard: raise RuntimeError('Laptop display power control is unavailable')
                 result = self.guard.send('on' if data['on'] else 'off')
-                self.report({'type': 'state', 'input_enabled': self.control, **{k: result[k] for k in ('display_available', 'display_on')}, 'display_error': ''})
+                if result.get('logical_size'): self.logical_size = result['logical_size']
+                self.report({'type': 'state', 'input_enabled': self.control, **{k: result[k] for k in ('display_available', 'display_on', 'phone_primary', 'extended_display')}, 'display_error': ''})
             elif action == 'input':
                 if not self.control or self.devices & 3 != 3: raise RuntimeError('Mouse and keyboard access was not approved')
                 sequence = data['seq']
@@ -401,8 +447,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--control', action='store_true')
     parser.add_argument('--state-dir', type=Path)
+    parser.add_argument('--phone-display', action='store_true')
+    parser.add_argument('--extended-display', action='store_true')
     args = parser.parse_args()
-    capture = Capture(args.control, args.state_dir)
+    capture = Capture(args.control, args.state_dir, args.phone_display, args.extended_display)
     threading.Thread(target=capture.read_controls, name='unity-screen-control', daemon=True).start()
     try:
         capture.run()

@@ -1,0 +1,21 @@
+{
+  "name": "firefox-session-continuity",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Firefox browsing context continuity",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "lint": "web-ext lint --source-dir extension --warnings-as-errors",
+    "package": "node scripts/package.mjs",
+    "fixtures": "node tests/fixtures/server.mjs",
+    "test:firefox": "node tests/firefox/run.mjs",
+    "test:unity": "dbus-run-session -- node tests/firefox/unity.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "jsdom": "26.1.0",
+    "web-ext": "10.8.0"
+  }
+}
